@@ -1068,7 +1068,7 @@ struct Consumer
         {
             for (uint32_t i = 0; i < SharedMemB::nbAccRowMaxSumCopies; i++)
             {
-                smem.accRowMaxLog2e[i][threadIdx.x] = -safeInitRowMax;
+                smem.accRowMaxLog2e[i][threadIdx.x] = safeInitRowMax;
                 smem.accRowSum[i][threadIdx.x] = 0;
             }
         }
