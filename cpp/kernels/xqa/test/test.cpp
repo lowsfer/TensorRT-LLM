@@ -728,7 +728,7 @@ void runTest(uint32_t batchSize, uint32_t seqLen, bool testPerf, bool refCheck, 
     }
     if (refCheck)
     {
-        float const qScaleForRef = isMLA ? qScale * sqrtf(192.F) : qScale;
+        float const qScaleForRef = isMLA ? qScale * sqrtf(576.F) : qScale;
         if (saveData)
         {
             save<float>("kv.bin", &cacheHeads[0][0], validElemsPerKHead * cacheHeads.size());
