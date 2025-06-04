@@ -208,7 +208,8 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     bool const applyRoPEInXqaKernel = isGMMAKernel && !isSpecDec
         && tensorrt_llm::common::contains({PositionEmbeddingType::kLONG_ROPE, PositionEmbeddingType::kROPE_GPT_NEOX,
                                               PositionEmbeddingType::kROPE_GPTJ},
-            xqaParams.position_embedding_type) && !xqaParams.isMLA();
+            xqaParams.position_embedding_type)
+        && !xqaParams.isMLA();
 
     unsigned int head_size = xqaParams.head_size;
     int num_q_heads = xqaParams.num_q_heads;
@@ -386,7 +387,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             appendParam(&launchParams.rcpOutScale);
         }
-        appendParam(kernel_input_tokens);
+        appendParam(&kernel_input_tokens);
         if (applyRoPEInXqaKernel)
         {
             appendParam(&launchParams.ropeCosSin);
