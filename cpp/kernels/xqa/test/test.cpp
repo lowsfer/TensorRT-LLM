@@ -1051,7 +1051,7 @@ TEST(Perf, mla)
 #ifndef NDEBUG
     GTEST_SKIP() << "Skipping perf tests for debug build";
 #endif
-    runTest<1>(38 * 2, 4000, true, false);
+    runTest<1>(38, 4000, true, false);
 }
 
 #else

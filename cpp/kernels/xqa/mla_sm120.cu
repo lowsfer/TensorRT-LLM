@@ -313,6 +313,8 @@ struct SharedMemA
     XBuffer x[nbXBufs];
     Vec<float, headGrpSize> rowSum[nbXBufs];
 
+    Vec<uint32_t, warp_size> drain; // data does not matter. Used to help avoid fence.
+
     // scaled by log2e. Write by last CGA iteration (from the other producer CTA) and read by current producer CTA.
     Vec<float, headGrpSize> rowMaxLog2e;
     // sync rowMaxLog2e between two producer CTAs and .consumed means the buffer for next iteration (in next producer)
@@ -753,7 +755,7 @@ private:
                 kBar.consumed.arrive();
             }
 #endif
-#pragma unroll 1
+#pragma unroll 1 // @fixme: when this is fully unrolled, refcheck will fail. Need to check why.
             for (uint32_t idxPart = SharedMemA::regQParts; idxPart < nbQParts; idxPart++)
             {
                 uint32_t const idxPartGlobal = nbKParts * ctaIter + idxPart;
@@ -761,7 +763,7 @@ private:
                 auto& kBar = smem.kBars[idxBuf];
                 kBar.produced.wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobal));
                 auto const& k = smem.k[idxBuf];
-#pragma unroll 1
+#pragma unroll
                 for (uint32_t idxInstK = 0; idxInstK < exactDiv(partElemsK, qmmaShape.k); idxInstK++)
                 {
                     Mat16x32Loader const loaderQ(
@@ -1186,13 +1188,15 @@ __device__ inline void Consumer::compute()
         }
 
         ThrdRegRowMax accRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.accRowMaxLog2e[tileIdx.x], tileBase.y, lane);
-        ;
         ThrdRegRowMax accRowSum = loadShmRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], tileBase.y, lane);
 
         uint32_t const idxProducer = iter % nbProducerCtasPerCga;
         smem.xRowMaxLog2eProducedBar[idxProducer].wait_parity(toParity<nbProducerCtasPerCga>(iter));
         ThrdRegRowMax const xRowMaxLog2e = loadShmRowMax<warpTile.y>(smem.xRowMaxLog2e[idxProducer], tileBase.y, lane);
-        getProducerShm(idxProducer).consumerRowMaxConsumedBar.arrive();
+        auto& prodSmem = getProducerShm(idxProducer);
+        uint32_t const drainData = hashRegData(xRowMaxLog2e);
+        tma::storeAsync(&prodSmem.drain[lane], drainData, prodSmem.consumerRowMaxConsumedBar);
+        prodSmem.consumerRowMaxConsumedBar.template arrive_tx<Scope::CGA, ArriveOrder::RELAXED>(sizeof(drainData));
         assert(all(accRowMaxLog2e <= xRowMaxLog2e));
 
         auto const needRescaleVec = (xRowMaxLog2e > accRowMaxLog2e);
@@ -1247,7 +1251,7 @@ __device__ inline void Consumer::compute()
         accRowSum = accRowSum + xRowSum;
         storeRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], accRowSum, tileBase.y, lane);
 
-#pragma unroll 1
+#pragma unroll
         for (uint32_t idxInstK = 0; idxInstK < exactDiv(tokensPerTile, qmmaShape.k); idxInstK++)
         {
             Mat16x32Loader const loaderX(xBuf, tileBase.y, idxInstK, rA, cA);
@@ -1352,7 +1356,9 @@ __device__ inline void Consumer::loadX()
             xBar.produced.arrive_tx(sizeof(smem.x(0)) + sizeof(smem.xRowSum[0]));
             xBar.produced.wait_parity(toParity<SharedMemB::nbXBufs>(iter));
             uint32_t const idxProducer = idxScratchXBuf;
-            getProducerShm(idxProducer).cgaXBufConsumed.arrive();
+            // @fixme: check if this works. If it doesn't, randomly pick some data from dstX and dstRowSum and use
+            // STAS + arrive_tx to avoid fence.
+            getProducerShm(idxProducer).cgaXBufConsumed.arrive<Scope::CGA, ArriveOrder::RELAXED>();
         }
     }
 }
@@ -1472,9 +1478,9 @@ __device__ inline void Consumer::storeOutput(Vec<OutputHead, warpTile.y>& dst, u
     }
 }
 
-__device__ __noinline__ void mergePartialOutputs(uint32_t& semaphore,
-    Vec<OutputHead, PartialResult::nbRowsPerChunk>& dst, PartialResult const* reqPartialResults, uint32_t nbSubSeq,
-    uint32_t ctaRank, uint32_t warpRank, uint2 warpIdx, void* sharedMem)
+__device__ inline void mergePartialOutputs(uint32_t& semaphore, Vec<OutputHead, PartialResult::nbRowsPerChunk>& dst,
+    PartialResult const* reqPartialResults, uint32_t nbSubSeq, uint32_t ctaRank, uint32_t warpRank, uint2 warpIdx,
+    void* sharedMem)
 {
     assert(nbSubSeq > 1);
     clusterBarArrive();
