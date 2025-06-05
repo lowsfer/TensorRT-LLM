@@ -1051,7 +1051,15 @@ TEST(Perf, mla)
 #ifndef NDEBUG
     GTEST_SKIP() << "Skipping perf tests for debug build";
 #endif
-    runTest<1>(38, 4000, true, false);
+    runTest<1>(38, 4096, true, false);
+}
+
+TEST(Perf, mla_real)
+{
+#ifndef NDEBUG
+    GTEST_SKIP() << "Skipping perf tests for debug build";
+#endif
+    runTest<1>(64, 4096, true, false);
 }
 
 #else

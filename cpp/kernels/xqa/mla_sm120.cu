@@ -292,11 +292,11 @@ constexpr uint32_t nbMathWarpsB = 8;
 
 constexpr uint32_t nbMultiBlockBufs = 2;
 constexpr uint32_t multiBlockMathWarps = 8;
-#define USE_REG_Q 0
+#define USE_REG_Q 1
 
 struct SharedMemA
 {
-    static inline constexpr uint32_t nbKBufs = 2;
+    static inline constexpr uint32_t nbKBufs = 4;
     static inline constexpr uint32_t nbXBufs = 2;
 #if USE_REG_Q
     static inline constexpr uint32_t regQParts = 2;
@@ -339,7 +339,7 @@ struct SharedMemA
 
     __device__ inline void invalidateBarriers(uint32_t thrdIdx)
     {
-        constexpr uint32_t nbBars = 21;
+        constexpr uint32_t nbBars = USE_REG_Q ? 25 : 21;
 #ifndef __CUDACC_RTC__
         constexpr uint32_t nbBarsRef
             = exactDiv(offsetof(SharedMemA, qkScaleLog2e) - offsetof(SharedMemA, rowMaxLog2eBar), 8);
@@ -498,7 +498,7 @@ struct Producer
 #ifndef NDEBUG
         if (threadIdx.x == 0)
         {
-            asm("st.bulk.weak [%0], %1, 0;\n" ::"l"(&smem), "n"(sizeof(SharedMemA)));
+            asm("st.bulk.weak [%0], %1, 0;\n" ::"l"(&smem), "n"(sizeof(SharedMemA)) : "memory");
         }
         __syncthreads();
 #endif
@@ -644,21 +644,21 @@ private:
 #pragma unroll 1
         for (uint32_t i = 0; i < SharedMemA::shmQParts; i++)
         {
+            uint32_t const idxPart = SharedMemA::regQParts + i;
 #if USE_REG_Q
             if (i < SharedMemA::nbRegQBars)
             {
                 static_assert(SharedMemA::regQParts % SharedMemA::nbRegQBars == 0);
-                uint32_t const idx = SharedMemA::regQParts + i;
-                uint32_t const idxBuf = idx % SharedMemA::nbRegQBars;
+                uint32_t const idxBuf = idxPart % SharedMemA::nbRegQBars;
                 assert(idxBuf == i);
                 auto& bar = smem.regQBars[idxBuf];
-                bar.consumed.wait_parity(toParity<SharedMemA::nbRegQBars>(idx));
+                bar.consumed.wait_parity(toParity<SharedMemA::nbRegQBars>(idxPart));
             }
 #endif
             if (warpElectSync())
             {
                 tma::loadAsync(&smem.q[i], args.tensorMapQ,
-                    DimsLE<2>{partElemsK * i, headGrpSize * idxInputTokenGlobal}, smem.shmQBar);
+                    DimsLE<2>{partElemsK * idxPart, headGrpSize * idxInputTokenGlobal}, smem.shmQBar);
             }
         }
         if (warpElectSync())
@@ -673,6 +673,76 @@ private:
 
     __device__ inline void compute()
     {
+        class KBarWaiter
+        {
+        public:
+            __device__ inline KBarWaiter(SharedMemA& smem, uint32_t ctaIter, uint32_t const idxPartInit)
+                : smem{smem}
+                , idxPartGlobalNext{nbKParts * ctaIter + idxPartInit}
+                , idxBufNext{idxPartGlobalNext % SharedMemA::nbKBufs}
+            {
+                testWaitNext();
+            }
+
+            __device__ inline void testWaitNext()
+            {
+#if 0
+                skipKBarWaitNext =
+                smem.kBars[idxBufNext].produced.test_wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobalNext));
+#else
+                skipKBarWaitNext = false;
+#endif
+            }
+
+            __device__ inline void wait()
+            {
+                if (!skipKBarWait)
+                {
+                    getKBar().produced.wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobal));
+                }
+            }
+
+            __device__ inline bool next()
+            {
+                idxPartGlobal = idxPartGlobalNext;
+                idxBuf = idxBufNext;
+                idxPartGlobalNext = idxPartGlobal + 1;
+                idxBufNext = idxPartGlobalNext % SharedMemA::nbKBufs;
+                skipKBarWait = skipKBarWaitNext;
+                return skipKBarWait;
+            }
+
+            __device__ inline void arrive()
+            {
+                getKBar().consumed.arrive();
+            }
+
+            __device__ inline SharedMemA::ShmKPart& getK()
+            {
+                return smem.k[idxBuf];
+            }
+
+        private:
+            __device__ inline CtaBarrierPair& getKBar()
+            {
+                return smem.kBars[idxBuf];
+            }
+
+            __device__ inline CtaBarrierPair& getKBarNext()
+            {
+                return smem.kBars[idxBufNext];
+            }
+
+        private:
+            SharedMemA& smem;
+            uint32_t idxPartGlobal;
+            uint32_t idxBuf;
+            bool skipKBarWait;
+            uint32_t idxPartGlobalNext;
+            uint32_t idxBufNext;
+            bool skipKBarWaitNext;
+        };
+
         uint32_t const grpIdx = warpIdx.y;
         uint32_t const tileBaseRow = warpTile.y * warpIdx.x;
         PingPongMutex tensorCoreMutex{smem.tensorCoreMutex, grpIdx};
@@ -722,23 +792,26 @@ private:
             using AtomBx2 = Vec<uint32_t, 4>; // one AtomB is 8x32 and AtomBx2 is 16x32
             // wait until it's our turn
             tensorCoreMutex.lock(grpIter);
+            KBarWaiter kBarWaiter{smem, ctaIter, 0};
 #if USE_REG_Q
 #pragma unroll
             for (uint32_t idxPart = 0; idxPart < SharedMemA::regQParts; idxPart++)
             {
-                uint32_t const idxPartGlobal = nbKParts * ctaIter + idxPart;
-                uint32_t const idxBuf = idxPartGlobal % SharedMemA::nbKBufs;
-                auto& kBar = smem.kBars[idxBuf];
-                kBar.produced.wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobal));
-                auto const& k = smem.k[idxBuf];
+                kBarWaiter.next();
+                kBarWaiter.wait();
 #pragma unroll
                 for (uint32_t idxInstK = 0; idxInstK < exactDiv(partElemsK, qmmaShape.k); idxInstK++)
                 {
-                    Mat16x32Loader const loader(k, 0, idxInstK, rB, cB);
+                    Mat16x32Loader const loaderK(kBarWaiter.getK(), 0, idxInstK, rB, cB);
 #pragma unroll
                     for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < exactDiv(tokensPerTile, qmmaShape.n * 2); idxAtomBx2++)
                     {
-                        AtomBx2 const atomBx2 = loader.load(idxAtomBx2);
+                        AtomBx2 const atomBx2 = loaderK.load(idxAtomBx2);
+                        if (idxInstK == exactDiv(partElemsK, qmmaShape.k) - 1
+                            && idxAtomBx2 == exactDiv(tokensPerTile, qmmaShape.n * 2) - 2 && idxPart != nbQParts - 1)
+                        {
+                            kBarWaiter.testWaitNext();
+                        }
 #pragma unroll
                         for (uint32_t i = 0; i < WarpAcc::rows; i++)
                         {
@@ -752,28 +825,30 @@ private:
                         }
                     }
                 }
-                kBar.consumed.arrive();
+                kBarWaiter.arrive();
             }
 #endif
-#pragma unroll 1 // @fixme: when this is fully unrolled, refcheck will fail. Need to check why.
+#pragma unroll 1
             for (uint32_t idxPart = SharedMemA::regQParts; idxPart < nbQParts; idxPart++)
             {
-                uint32_t const idxPartGlobal = nbKParts * ctaIter + idxPart;
-                uint32_t const idxBuf = idxPartGlobal % SharedMemA::nbKBufs;
-                auto& kBar = smem.kBars[idxBuf];
-                kBar.produced.wait_parity(toParity<SharedMemA::nbKBufs>(idxPartGlobal));
-                auto const& k = smem.k[idxBuf];
+                kBarWaiter.next();
+                kBarWaiter.wait();
 #pragma unroll
                 for (uint32_t idxInstK = 0; idxInstK < exactDiv(partElemsK, qmmaShape.k); idxInstK++)
                 {
                     Mat16x32Loader const loaderQ(
                         smem.q[idxPart - SharedMemA::regQParts], tileBaseRow, idxInstK, rA, cA);
                     auto const qPart = loaderQ.loadWholeCol<warpTile.y>();
-                    Mat16x32Loader const loaderK(k, 0, idxInstK, rB, cB);
+                    Mat16x32Loader const loaderK(kBarWaiter.getK(), 0, idxInstK, rB, cB);
 #pragma unroll
                     for (uint32_t idxAtomBx2 = 0; idxAtomBx2 < exactDiv(tokensPerTile, qmmaShape.n * 2); idxAtomBx2++)
                     {
                         AtomBx2 const atomBx2 = loaderK.load(idxAtomBx2);
+                        if (idxInstK == exactDiv(partElemsK, qmmaShape.k) - 1
+                            && idxAtomBx2 == exactDiv(tokensPerTile, qmmaShape.n * 2) - 2 && idxPart != nbQParts - 1)
+                        {
+                            kBarWaiter.testWaitNext();
+                        }
 #pragma unroll
                         for (uint32_t i = 0; i < WarpAcc::rows; i++)
                         {
@@ -787,7 +862,7 @@ private:
                         }
                     }
                 }
-                kBar.consumed.arrive();
+                kBarWaiter.arrive();
             }
             tensorCoreMutex.unlock(); // let the other group to use tensor cores
             uint32_t const validTokens = seqLen - tokensPerTile * idxTile;
@@ -1062,7 +1137,7 @@ struct Consumer
 #ifndef NDEBUG
         if (threadIdx.x == 0)
         {
-            asm("st.bulk.weak [%0], %1, 0;\n" ::"l"(&smem), "n"(sizeof(SharedMemB)));
+            asm("st.bulk.weak [%0], %1, 0;\n" ::"l"(&smem), "n"(sizeof(SharedMemB)) : "memory");
         }
         __syncthreads();
 #endif

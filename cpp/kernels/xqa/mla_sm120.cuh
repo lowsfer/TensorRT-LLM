@@ -75,9 +75,10 @@ __device__ inline QuadRegRowMaxT<tileM> computeRowMax(WarpAccT<tileM, tileN> con
     return rowMaxLog2e;
 }
 
-template <uint32_t n>
-__device__ inline uint32_t hashRegData(Vec<float, n> const& data)
+template <typename T, uint32_t n>
+__device__ inline uint32_t hashRegData(Vec<T, n> const& data)
 {
+    static_assert(sizeof(T) == 4);
     uint32_t result = 0;
 #pragma unroll
     for (uint32_t i = 0; i < n; i++)

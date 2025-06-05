@@ -57,12 +57,12 @@ public:
     __device__ inline MBarrier(uint32_t count)
     {
         assert(count > 0);
-        asm volatile("mbarrier.init.b64 [%0], %1;\n" ::"l"(addr()), "r"(count));
+        asm volatile("mbarrier.init.b64 [%0], %1;\n" ::"l"(addr()), "r"(count) : "memory");
     }
 
     __device__ ~MBarrier()
     {
-        asm volatile("mbarrier.inval.b64 [%0];\n" ::"l"(addr()));
+        asm volatile("mbarrier.inval.b64 [%0];\n" ::"l"(addr()) : "memory");
     }
 
     template <Scope scope = defaultScope, ArriveOrder order = ArriveOrder::RELEASE>
@@ -77,12 +77,14 @@ public:
             case ArriveOrder::RELEASE:
                 asm volatile("mbarrier.arrive.release.cta.b64 %0, [%1], %2;\n"
                              : "=l"(token)
-                             : "l"(addr()), "r"(update));
+                             : "l"(addr()), "r"(update)
+                             : "memory");
                 break;
             case ArriveOrder::RELAXED:
                 asm volatile("mbarrier.arrive.relaxed.cta.b64 %0, [%1], %2;\n"
                              : "=l"(token)
-                             : "l"(addr()), "r"(update));
+                             : "l"(addr()), "r"(update)
+                             : "memory");
                 break;
             }
             return token;
@@ -93,10 +95,12 @@ public:
             switch (order)
             {
             case ArriveOrder::RELEASE:
-                asm volatile("mbarrier.arrive.release.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(update));
+                asm volatile("mbarrier.arrive.release.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(update)
+                             : "memory");
                 break;
             case ArriveOrder::RELAXED:
-                asm volatile("mbarrier.arrive.relaxed.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(update));
+                asm volatile("mbarrier.arrive.relaxed.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(update)
+                             : "memory");
                 break;
             }
             return;
@@ -107,15 +111,16 @@ public:
         {
             asm volatile("mbarrier.arrive.noComplete" STR_REL_CTA ".b64 %0, [%1], %2;\n"
                          : "=l"(token)
-                         : "l"(addr()), "r"(update - 1U));
+                         : "l"(addr()), "r"(update - 1U)
+                         : "memory");
             ArrivalToken refToken;
-            asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(refToken) : "l"(addr()));
+            asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(refToken) : "l"(addr()) : "memory");
             assert(token == refToken);
             return token;
         }
         else
         {
-            asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(token) : "l"(addr()));
+            asm volatile("mbarrier.arrive" STR_REL_CTA ".b64 %0, [%1];\n" : "=l"(token) : "l"(addr()) : "memory");
             return token;
         }
 #endif
@@ -136,7 +141,8 @@ public:
         assert(!isLocal());
         asm volatile("mbarrier.arrive.release.cluster.shared::cluster.b64 _, [%0], %1;\n"
                      :
-                     : "l"(__cvta_generic_to_shared(&mBar)), "r"(update));
+                     : "l"(__cvta_generic_to_shared(&mBar)), "r"(update)
+                     : "memory");
 #else
         asm volatile("trap;\n");
 #endif
@@ -151,12 +157,14 @@ public:
             ArrivalToken token;
             asm volatile("mbarrier.arrive.expect_tx.relaxed.cta.b64 %0, [%1], %2;\n"
                          : "=l"(token)
-                         : "l"(addr()), "r"(txCount));
+                         : "l"(addr()), "r"(txCount)
+                         : "memory");
             return token;
         }
         else
         {
-            asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(txCount));
+            asm volatile("mbarrier.arrive.expect_tx.relaxed.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(txCount)
+                         : "memory");
             return;
         }
 #else
@@ -179,12 +187,14 @@ public:
                 case ArriveOrder::RELEASE:
                     asm volatile("mbarrier.arrive.expect_tx.release.cta.b64 %0, [%1], %2;\n"
                                  : "=l"(token)
-                                 : "l"(addr()), "r"(txCount));
+                                 : "l"(addr()), "r"(txCount)
+                                 : "memory");
                     break;
                 case ArriveOrder::RELAXED:
                     asm volatile("mbarrier.arrive.expect_tx.relaxed.cta.b64 %0, [%1], %2;\n"
                                  : "=l"(token)
-                                 : "l"(addr()), "r"(txCount));
+                                 : "l"(addr()), "r"(txCount)
+                                 : "memory");
                     break;
                 }
                 return token;
@@ -196,11 +206,13 @@ public:
                 {
                 case ArriveOrder::RELEASE:
                     asm volatile(
-                        "mbarrier.arrive.expect_tx.release.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(txCount));
+                        "mbarrier.arrive.expect_tx.release.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(txCount)
+                        : "memory");
                     break;
                 case ArriveOrder::RELAXED:
                     asm volatile(
-                        "mbarrier.arrive.expect_tx.relaxed.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(txCount));
+                        "mbarrier.arrive.expect_tx.relaxed.cluster.b64 _, [%0], %1;\n" ::"l"(addr()), "r"(txCount)
+                        : "memory");
                     break;
                 }
                 return;
@@ -210,11 +222,12 @@ public:
         {
             if constexpr (scope == Scope::CTA)
             {
-                asm volatile("mbarrier.expect_tx.relaxed.cta.b64 [%0], %1;\n" ::"l"(addr()), "r"(txCount));
+                asm volatile("mbarrier.expect_tx.relaxed.cta.b64 [%0], %1;\n" ::"l"(addr()), "r"(txCount) : "memory");
             }
             else
             {
-                asm volatile("mbarrier.expect_tx.relaxed.cluster.b64 [%0], %1;\n" ::"l"(addr()), "r"(txCount));
+                asm volatile("mbarrier.expect_tx.relaxed.cluster.b64 [%0], %1;\n" ::"l"(addr()), "r"(txCount)
+                             : "memory");
             }
             return arrive<scope, order>(arriveCount);
         }
@@ -300,7 +313,8 @@ public:
                 "selp.b32 %0, 1, 0, ready;\n"
                 "}\n"
                 : "=r"(ready)
-                : "l"(addr()), "l"(token), "n"(kSUSPEND_TIME_HINT));
+                : "l"(addr()), "l"(token), "n"(kSUSPEND_TIME_HINT)
+                : "memory");
         }
         else
         {
@@ -311,7 +325,8 @@ public:
                 "selp.b32 %0, 1, 0, ready;\n"
                 "}\n"
                 : "=r"(ready)
-                : "l"(addr()), "l"(token), "n"(kSUSPEND_TIME_HINT));
+                : "l"(addr()), "l"(token), "n"(kSUSPEND_TIME_HINT)
+                : "memory");
         }
         return ready != 0;
     }
@@ -329,7 +344,8 @@ public:
                 "selp.b32 %0, 1, 0, ready;\n"
                 "}\n"
                 : "=r"(ready)
-                : "l"(addr()), "r"(uint32_t{parity}), "n"(kSUSPEND_TIME_HINT));
+                : "l"(addr()), "r"(uint32_t{parity}), "n"(kSUSPEND_TIME_HINT)
+                : "memory");
         }
         else
         {
@@ -340,7 +356,8 @@ public:
                 "selp.b32 %0, 1, 0, ready;\n"
                 "}\n"
                 : "=r"(ready)
-                : "l"(addr()), "r"(uint32_t{parity}), "n"(kSUSPEND_TIME_HINT));
+                : "l"(addr()), "r"(uint32_t{parity}), "n"(kSUSPEND_TIME_HINT)
+                : "memory");
         }
         return ready != 0;
     }
@@ -434,12 +451,12 @@ public:
 
     __device__ inline void arrive() const
     {
-        asm volatile("barrier.cta.arrive %0, %1;\n" ::"r"(mName), "r"(mArriveCount));
+        asm volatile("barrier.cta.arrive %0, %1;\n" ::"r"(mName), "r"(mArriveCount) : "memory");
     }
 
     __device__ inline void arrive_and_wait() const
     {
-        asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(mName), "r"(mArriveCount));
+        asm volatile("barrier.cta.sync %0, %1;\n" ::"r"(mName), "r"(mArriveCount) : "memory");
     }
 
 private:

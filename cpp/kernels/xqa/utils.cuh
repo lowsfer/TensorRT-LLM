@@ -549,15 +549,17 @@ __device__ inline Vec<uint32_t, nbMat> ldmatrix(LdGrain const* row)
     {
         if (transpose)
         {
-            asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                         : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
-                         : "l"(__cvta_generic_to_shared(row)));
+            asm("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         else
         {
             asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
 #if 0
         auto checkMat = [&](uint32_t val, uint32_t idxMat) -> Vec<uint16_t, 8> const& {
@@ -595,13 +597,15 @@ __device__ inline Vec<uint32_t, nbMat> ldmatrix(LdGrain const* row)
         {
             asm("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
                 : "=r"(a), "=r"(b)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         else
         {
             asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
                 : "=r"(a), "=r"(b)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         return Vec<uint32_t, 2>{a, b};
     }
@@ -611,11 +615,15 @@ __device__ inline Vec<uint32_t, nbMat> ldmatrix(LdGrain const* row)
         {
             asm("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 %0, [%1];\n"
                 : "=r"(a)
-                : "l"(__cvta_generic_to_shared(row)));
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         else
         {
-            asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 %0, [%1];\n" : "=r"(a) : "l"(__cvta_generic_to_shared(row)));
+            asm("ldmatrix.sync.aligned.m8n8.x2.shared.b16 %0, [%1];\n"
+                : "=r"(a)
+                : "l"(__cvta_generic_to_shared(row))
+                : "memory");
         }
         return Vec<uint32_t, 1>{a};
     }
@@ -639,14 +647,16 @@ __device__ inline Vec<uint32_t, nbMat * 2> ldmatrix_16x16_trans(LdGrain const* r
     {
         asm("ldmatrix.sync.aligned.m16n16.x1.trans.shared::cta.b8 {%0, %1}, [%2];\n"
             : "=r"(a), "=r"(b)
-            : "l"(__cvta_generic_to_shared(row)));
+            : "l"(__cvta_generic_to_shared(row))
+            : "memory");
         return Vec<uint32_t, 2>{a, b};
     }
     else if constexpr (nbMat == 2)
     {
         asm("ldmatrix.sync.aligned.m16n16.x2.trans.shared::cta.b8 {%0, %1, %2, %3}, [%4];\n"
             : "=r"(a), "=r"(b), "=r"(c), "=r"(d)
-            : "l"(__cvta_generic_to_shared(row)));
+            : "l"(__cvta_generic_to_shared(row))
+            : "memory");
         return Vec<uint32_t, 4>{a, b, c, d};
     }
     else
@@ -664,44 +674,47 @@ __device__ inline void stmatrix(LdGrain* row, Vec<uint32_t, nbMat> const& data)
     {
         if constexpr (transpose)
         {
-            asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
-                             __cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]));
+            asm("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
+                    __cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3])
+                : "memory");
         }
         else
         {
-            asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
-                             __cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]));
+            asm("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n" ::"l"(
+                    __cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3])
+                : "memory");
         }
     }
     else if constexpr (nbMat == 2)
     {
         if constexpr (transpose)
         {
-            asm volatile(
-                "stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]));
+            asm("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1])
+                : "memory");
         }
         else
         {
-            asm volatile(
-                "stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]), "r"(data[1]));
+            asm("stmatrix.sync.aligned.m8n8.x2.shared.b16 [%0], {%1, %2};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0]), "r"(data[1])
+                : "memory");
         }
     }
     else if constexpr (nbMat == 1)
     {
         if constexpr (transpose)
         {
-            asm volatile(
-                "stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]));
+            asm("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0])
+                : "memory");
         }
         else
         {
-            asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
-                "r"(data[0]));
+            asm("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n" ::"l"(__cvta_generic_to_shared(row)),
+                "r"(data[0])
+                : "memory");
         }
     }
     else
