@@ -1170,7 +1170,6 @@ int AttentionOp::mlaGeneration(
             xqaParams.quant_q_buffer_ptr = quant_q_buffer_ptr;
             xqaParams.q_scaling
                 = 1 / (mQScaling * sqrtf((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
-            xqaParams.multi_query_tokens = (params.acc_q_len / batch_beam) > 1;
             if (mEnableXQA && mXqaDispatcher->shouldUse(xqaParams))
             {
                 TLLM_LOG_DEBUG("XQA kernels are selected in the generation phase.");

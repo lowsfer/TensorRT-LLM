@@ -367,8 +367,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             + xqaMlaCgaXBufSize * multi_block * xqaParams.total_num_input_tokens;
         appendParam(&partialResults);
         kernelParams[idxNextParam] = nullptr; // one extra nullptr at end as guard.
-        uint32_t const inputSeqLen
-            = xqaParams.multi_query_tokens ? static_cast<uint32_t>(xqaParams.generation_input_length) : 1U;
+        uint32_t const inputSeqLen = (xqaParams.multi_query_tokens || xqaParams.isMLA())
+            ? static_cast<uint32_t>(xqaParams.generation_input_length)
+            : 1U;
         dim3 const dimGrid{4 * inputSeqLen, multi_block, xqaParams.batch_size};
         dim3 const blockDim(128 * 3, 1, 1);
         cubinObj->launch(dimGrid, blockDim, stream, kernelParams);
