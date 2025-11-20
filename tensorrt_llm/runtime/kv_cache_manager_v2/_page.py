@@ -64,7 +64,7 @@ class Page(Slot):
             assert not self.scheduled_for_eviction
         return holder
 
-    # Prevent eviction. You need to migrate the page to GPU later.
+    # Prevent eviction.
     def lock(self,
              kv_cache: '_KVCache',
              beam_index: BeamIndex,
@@ -140,13 +140,18 @@ class UncommittedPage(Page):
         return committed_page
 
     def __del__(self):
-        check_page = lambda p: p is None or isinstance(p.page, CommittedPage)
         if not NDEBUG:
+            check_page = lambda p: p is None or isinstance(
+                p.page, CommittedPage)
             assert_critical(
                 len(unwrap_weakref(self.kv_cache)._blocks) <= self.ordinal
                 or check_page(
                     unwrap_weakref(self.kv_cache)._blocks[self.ordinal].pages[
                         self.beam_index][self.life_cycle]))
+        kv_cache = unwrap_weakref(self.kv_cache)
+        if kv_cache._reserved_slots is not None and self.cache_level == GPU_LEVEL:
+            pg_idx = self.manager.get_pool_group_index(self.life_cycle)
+            kv_cache._reserved_slots[pg_idx].append(self.move_to_new_slot())
         Page.__del__(self)
 
 
@@ -348,34 +353,40 @@ def batched_lock_to_gpu(
         kv_cache: '_KVCache',
         tasks: Sequence[BatchedLockTarget]) -> list['_SharedPageLock']:
     'Lock pages after migrating all pages to GPU. If migration fails, no locking happens.'
+    reserved_slots = kv_cache._reserved_slots
+    use_reserved_slots = reserved_slots is not None
     storage = kv_cache.manager._storage
     assert not tasks or storage is get_uniform_attribute(
         tasks, lambda p: p.page.manager)
     requirements = filled_list(0, storage.num_pool_groups)
     scheduled_for_eviction = [t.page.scheduled_for_eviction for t in tasks]
+    lc_to_pg = storage._life_cycle_grouping
     for t, e in zip(tasks, scheduled_for_eviction):
         if e:
             storage.exclude_from_eviction(t.page)
         if t.page.cache_level == GPU_LEVEL:
             continue
-        requirements[storage.get_pool_group_index(t.life_cycle)] += 1
+        requirements[lc_to_pg[t.life_cycle]] += 1
 
     try:
-        storage.prepare_free_slots(GPU_LEVEL, requirements)
+        if not use_reserved_slots:
+            storage.prepare_free_slots(GPU_LEVEL, requirements)
         partitioned = partition(
-            tasks, lambda p:
-            (p.page.cache_level, storage.get_pool_group_index(p.life_cycle)))
+            tasks, lambda p: (p.page.cache_level, lc_to_pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue
+            slot_queue = reserved_slots[pg_idx] if use_reserved_slots else None
             storage._batched_migrate(pg_idx,
                                      GPU_LEVEL,
                                      lvl, [p.page for p in part],
-                                     update_src=True)
+                                     update_src=True,
+                                     slot_queue=slot_queue)
     except Exception:
-        for t, e in zip(tasks, scheduled_for_eviction):
-            if e:
-                storage.schedule_for_eviction(t.page)
+        if not use_reserved_slots:
+            for t, e in zip(tasks, scheduled_for_eviction):
+                if e:
+                    storage.schedule_for_eviction(t.page)
         raise
     stream_wait_events(kv_cache.cuda_stream,
                        (p.page.ready_event for p in tasks))

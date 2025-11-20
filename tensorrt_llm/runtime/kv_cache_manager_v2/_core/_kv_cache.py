@@ -1,11 +1,13 @@
 import array
 import enum
 import weakref
+from collections import deque
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, cast
+from typing import (TYPE_CHECKING, Any, Callable, Iterable, Iterator,
+                    NamedTuple, cast)
 
 from .._block_radix_tree import Block, UselessBlockError
 from .._common import (BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, BeamIndex,
@@ -17,6 +19,7 @@ from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId
 from .._page import (BatchedLockTarget, CommittedPage, UncommittedPage,
                      _PageHolder, _SharedPageLock, batched_lock_to_gpu)
 from .._storage._config import BufferId
+from .._storage._core import PoolGroupIndex, Slot
 from .._storage_manager import StorageManager
 from .._utils import (CachedCudaEvent, TemporaryCudaStream, TypedIndexList,
                       div_up, expect_type, filled_list, find_index, make_typed,
@@ -53,6 +56,12 @@ class SeqBlock:
         self.pages.clear()
 
 
+class ReservationConfig(NamedTuple):
+    max_capacity: int
+    prefill_chunks: Iterable[int]
+    decode_max_draft_length: int
+
+
 # The _KVCache holds unique/shared ownership of memory blocks. On deletion, the ownership if destroys and KVCacheManager takes control of them. A KV cache maintains three lengths:
 #  1.	num_committed_tokens: the number of tokens that are finalized, immutable and ready for reuse.
 #  2.	history_length: a cursor separating history and the space for next input tokens. History tokens are defined as tokens without query data for the next inference step. For SWA layers, it decides which blocks are out-of-window and can be evicted/dropped. In most cases, you don’t need to touch history_length as it’s automatically bumped by the increase of num_committed_tokens, except a few cases:
@@ -67,7 +76,7 @@ class _KVCache:
                  '_cuda_stream', '_status', '_beam_width', '_capacity',
                  '_history_length', '_commit_state', '_blocks', '_page_indices',
                  '_committed_tokens', '_num_committed_blocks', '_finish_event',
-                 '_tokens_per_block', '__weakref__')
+                 '_tokens_per_block', '_reserved_slots', '__weakref__')
 
     class Status(enum.Enum):
         ACTIVE = enum.auto()
@@ -104,6 +113,8 @@ class _KVCache:
 
     _tokens_per_block: int
 
+    _reserved_slots: TypedIndexList[PoolGroupIndex, deque[Slot]] | None
+
     def __init__(self, manager: 'KVCacheManager', lora_task_id: int | None,
                  input_tokens: Sequence[TokenIdExt] | None, id: Any,
                  custom_priority_callback: Callable[[BlockOrdinal, LifeCycle],
@@ -126,6 +137,7 @@ class _KVCache:
         self._num_committed_blocks = BlockOrdinal(0)
         self._finish_event = None
         self._tokens_per_block = manager.tokens_per_block
+        self._reserved_slots = None
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
         assert NDEBUG or self._check_sanity()
@@ -224,7 +236,8 @@ class _KVCache:
         beam_width = BeamIndex(self.beam_width)
         num_life_cycles = self.manager._life_cycles.size
         if new_num_blocks < old_num_blocks:
-            del self._blocks[new_num_blocks:]
+            with self._record_event():
+                del self._blocks[new_num_blocks:]
             for beam_indices in self._page_indices:
                 for indices in beam_indices:
                     assert all(i == BAD_PAGE_INDEX
@@ -378,6 +391,7 @@ class _KVCache:
     # suspend+resume allows us to implement dynamic batch size. May also be used to support HSTU model.
     def suspend(self):
         assert self.status == self.Status.ACTIVE
+        assert not self.space_reserved, "Cannot suspend with reserved space"
         assert self._check_sanity()
         assert self._finish_event is None
         # used by _SharedPageLock.__del__
@@ -385,7 +399,7 @@ class _KVCache:
             for ordinal, beam_idx, lc_idx in self._active_pages():
                 beam_block = self._block(ordinal, beam_idx)
                 holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
-                # after this assignment, __del__ of the original _SharedPageLock will use self.finish_event to indicate end of usage for the page.
+                # after this assignment, __del__ of the original _SharedPageLock will use self._finish_event to indicate end of usage for the page.
                 beam_block[lc_idx] = holder
         self._status = self.Status.SUSPENDED
 
@@ -770,7 +784,7 @@ class _KVCache:
                 num_slots = filled_list(0, life_cycles.size)
                 num_slots[lc_idx] = 1
                 pg_idx = storage.get_pool_group_index(lc_idx)
-                # try to fine one slot in any cache level
+                # try to find one slot in any cache level
                 for i in range(manager._storage.num_cache_levels):
                     lvl = CacheLevel(i + page.cache_level)
                     try:
@@ -810,6 +824,13 @@ class _KVCache:
                                (len(self._blocks) - len(indices)))
 
     def _clear_blocks(self):
+        # release reserved slots
+        if self._reserved_slots is not None:
+            gpu_storage = self._storage._levels[GPU_LEVEL].storage
+            for pg_idx, slots in typed_enumerate(self._reserved_slots):
+                for slot in slots:
+                    gpu_storage.release(pg_idx, slot)
+            self._reserved_slots = None
         # drop the last block first
         while self._blocks:
             self._blocks.pop()
@@ -862,3 +883,59 @@ class _KVCache:
             self._history_length = history_length
             return True
         return False
+
+    def reserve_space(self, max_capacity: int, prefill_chunks: Iterable[int],
+                      decode_max_draft_length: int) -> bool:
+        '''
+        Reserve space for all future growth.
+        max_prefill_input_length: the max possible input length for one prefill step. It depends on the number of mismatched tokens and chunked prefill.
+        max_decode_input_length: the max possible input length for one decode step. Use 1 if no speculative decoding.
+        After a successful call of this API, the KV cache cannot be suspended.
+        '''
+        assert self.status == self.Status.ACTIVE and self._reserved_slots is None
+        life_cycles = self.manager._life_cycles
+        tps = self.tokens_per_block
+        storage = self.manager._storage
+        num_pool_groups = storage.num_pool_groups
+        lc_grouping = storage._life_cycle_grouping
+        num_pages = filled_list(0, num_pool_groups)
+
+        def update_num_pages(hist_len: int, input_len: int):
+            capacity = hist_len + input_len
+            num_blocks = div_up(capacity, tps)
+            cnt = filled_list(0, num_pool_groups)
+            for lc_idx, lc in life_cycles.items():
+                pg_idx = lc_grouping[lc_idx]
+                cnt[pg_idx] += num_blocks
+                if lc.window_size is not None:
+                    stale_start, stale_end = _KVCache._get_stale_range(
+                        tps, hist_len, lc)
+                    cnt[pg_idx] -= (stale_end - stale_start)
+            for i in typed_range(num_pool_groups):
+                num_pages[i] = max(num_pages[i], cnt[i])
+
+        hist_len = self.num_committed_tokens
+        # prefill-phase
+        for chunk_size in prefill_chunks:
+            update_num_pages(hist_len, chunk_size)
+            hist_len += chunk_size
+        # decode-phase
+        update_num_pages(max_capacity - decode_max_draft_length,
+                         decode_max_draft_length)
+        # pre-allocate slots
+        try:
+            slots = storage.new_gpu_slots_per_pool_group(num_pages)
+        except OutOfPagesError:
+            return False
+        except Exception:
+            raise
+        self._reserved_slots = cast(TypedIndexList[PoolGroupIndex, deque[Slot]],
+                                    [deque(s) for s in slots])
+        raise NotImplementedError(
+            "When a page with reserved slot is released, it should be moved to  _reserved_slots, but this is not implemented yet"
+        )
+        return True
+
+    @property
+    def space_reserved(self) -> bool:
+        return self._reserved_slots is not None

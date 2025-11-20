@@ -1,6 +1,7 @@
 import os
 import warnings
 import weakref
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Sequence, cast
 
@@ -25,7 +26,8 @@ from ._storage._core import (DiskCacheLevelStorage, GpuCacheLevelStorage,
 from ._utils import (Array2D, CachedCudaEvent, HomoTuple, TemporaryCudaStream,
                      TypedIndexList, filled_array2d, filled_list,
                      get_uniform_attribute, make_typed, map_optional, partition,
-                     remove_if, typed_enumerate, typed_range, unwrap_weakref)
+                     remove_if, typed_enumerate, typed_len, typed_range,
+                     unwrap_weakref)
 
 
 class CacheLevelManager:
@@ -125,28 +127,49 @@ class StorageManager:
         self, level: CacheLevel, num_slots: TypedIndexList[LifeCycleId, int]
     ) -> TypedIndexList[LifeCycleId, list[Slot]]:
         pg_num_slots = filled_list(0, self.num_pool_groups)
+        lc_to_pg = self._life_cycle_grouping
         for lc in typed_range(self.num_life_cycles):
-            pg_num_slots[self.get_pool_group_index(lc)] += num_slots[lc]
+            pg_num_slots[lc_to_pg[lc]] += num_slots[lc]
+        pg_slots = self.new_slots_per_pool_group(level, pg_num_slots)
+        ret = make_typed(lambda: list[Slot](), self.num_life_cycles)
+        for life_cycle in typed_range(self.num_life_cycles):
+            pg = pg_slots[lc_to_pg[life_cycle]]
+            cnt = num_slots[life_cycle]
+            pg_cnt = len(pg)
+            assert cnt <= pg_cnt
+            ret[life_cycle][:] = pg[pg_cnt - cnt:]
+            del pg[pg_cnt - cnt:]
+        assert all(not pg for pg in pg_slots)
+        return ret
+
+    def new_slots_per_pool_group(
+        self, level: CacheLevel, num_slots: TypedIndexList[PoolGroupIndex, int]
+    ) -> TypedIndexList[PoolGroupIndex, list[Slot]]:
+        assert typed_len(num_slots) == self.num_pool_groups
         storage = self._levels[level].storage
-        if any(pg_num_slots[pg] > storage.get_num_free_slots(pg)
+        get_num_free_slots = storage.get_num_free_slots
+        if any(num_slots[pg] > get_num_free_slots(pg)
                for pg in typed_range(self.num_pool_groups)):
-            self.prepare_free_slots(level, pg_num_slots)
-        assert all(pg_num_slots[pg] <= storage.get_num_free_slots(pg)
+            self.prepare_free_slots(level, num_slots)
+        assert all(num_slots[pg] <= get_num_free_slots(pg)
                    for pg in typed_range(self.num_pool_groups))
-        ret = filled_list(list[Slot](), self.num_life_cycles)
+        ret = filled_list(list[Slot](), self.num_pool_groups)
+        allocate_multiple = storage.allocate_multiple
         try:
-            for life_cycle in typed_range(self.num_life_cycles):
-                pg_idx = self.get_pool_group_index(life_cycle)
-                ret[life_cycle] = storage.allocate_multiple(
-                    pg_idx, num_slots[life_cycle])
+            for pg_idx, cnt in typed_enumerate(num_slots):
+                ret[pg_idx] = allocate_multiple(pg_idx, cnt)
         except Exception:
             warnings.warn("Exception not expected here. Please report a bug.")
-            for lc, slots in typed_enumerate(ret):
-                pg_idx = self.get_pool_group_index(lc)
+            for pg_idx, slots in typed_enumerate(ret):
                 for s in slots:
                     storage.release(pg_idx, s)
             raise
         return ret
+
+    def new_gpu_slots_per_pool_group(
+        self, num_slots: TypedIndexList[PoolGroupIndex, int]
+    ) -> TypedIndexList[PoolGroupIndex, list[Slot]]:
+        return self.new_slots_per_pool_group(GPU_LEVEL, num_slots)
 
     @property
     def kv_cache_manager(self) -> 'KVCacheManager':
@@ -283,26 +306,37 @@ class StorageManager:
                                       dst_lvl,
                                       src_lvl,
                                       pages,
-                                      update_src=True)
+                                      update_src=True,
+                                      slot_queue=None)
                 for p in pages:
                     if is_last_level and p.status == PageStatus.HELD:
                         continue
                     self._levels[dst_lvl].controller.schedule_for_eviction(p)
         return
 
-    def _batched_migrate(self, pool_group_index: PoolGroupIndex,
-                         dst_level: CacheLevel, src_level: CacheLevel,
-                         src_pages: Sequence[Page],
-                         update_src: bool) -> Sequence[Slot] | None:
-        'Free slots must be prepared before calling this function.'
+    def _batched_migrate(
+            self,
+            pool_group_index: PoolGroupIndex,
+            dst_level: CacheLevel,
+            src_level: CacheLevel,
+            src_pages: Sequence[Page],
+            update_src: bool,
+            slot_queue: deque[Slot] | None = None) -> Sequence[Slot] | None:
+        '''Free slots must be prepared before calling this function.
+        If slot_queue of pre-allocated slots is provided, it will be used to provide slots. All slots in slot_queue must be from the cache level and pool group specified by dst_level and pool_group_index.
+        '''
         assert dst_level != src_level, "dst_level and src_level must be different"
         num_slots = len(src_pages)
         num_pools = self.num_pools(pool_group_index)
         src_pool_group = self._pool_group(src_level, pool_group_index)
         dst_pool_group = self._pool_group(dst_level, pool_group_index)
-        if dst_pool_group.num_free_slots < num_slots:
-            raise OutOfPagesError("Not enough free slots")
-        dst_slots = dst_pool_group.allocate_multiple(num_slots)
+        if slot_queue is None:
+            if dst_pool_group.num_free_slots < num_slots:
+                raise OutOfPagesError("Not enough free slots")
+            dst_slots = dst_pool_group.allocate_multiple(num_slots)
+        else:
+            assert len(slot_queue) >= num_slots
+            dst_slots = [slot_queue.popleft() for _ in range(num_slots)]
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
@@ -338,8 +372,11 @@ class StorageManager:
                         self.schedule_for_eviction(src)
             return None if update_src else dst_slots
         except Exception:
-            for s in dst_slots:
-                dst_pool_group.release(s)
+            if slot_queue is None:
+                for s in dst_slots:
+                    dst_pool_group.release(s)
+            else:
+                slot_queue.extendleft(reversed(dst_slots))
             raise
 
     def _pool_group(self, cache_level: CacheLevel,
