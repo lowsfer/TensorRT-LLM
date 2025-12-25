@@ -80,7 +80,7 @@ class SeqBlock:
             or not ret
             or all(
                 p is None or isinstance(p.page, CommittedPage)
-                for p in sum(cast(list[list[BlockPage]], self.pages), [])
+                for p in chain.from_iterable(self.pages)
             )
         )
         assert (
@@ -88,7 +88,7 @@ class SeqBlock:
             or ret
             or all(
                 p is None or isinstance(p.page, UncommittedPage)
-                for p in sum(cast(list[list[BlockPage]], self.pages), [])
+                for p in chain.from_iterable(self.pages)
             )
         )
         return ret
@@ -382,7 +382,9 @@ class _KVCache:
                         indices.extend([BAD_PAGE_INDEX] * (new_num_blocks - old_num_blocks))
                     else:
                         assert len(indices) >= new_num_blocks
-            stream_wait_events(self.cuda_stream, (s.ready_event for s in sum(slots, [])))
+            stream_wait_events(
+                self.cuda_stream, (s.ready_event for s in chain.from_iterable(slots))
+            )
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
                 block = make_typed(
                     lambda: filled_list(cast(BlockPage, None), num_life_cycles), beam_width
