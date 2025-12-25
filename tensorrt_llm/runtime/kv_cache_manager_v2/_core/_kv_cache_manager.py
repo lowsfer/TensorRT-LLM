@@ -23,6 +23,7 @@ from .._utils import (
     HomoTuple,
     TypedIndexList,
     div_up,
+    exact_div,
     filled_list,
     init_cuda_once,
     typed_enumerate,
@@ -80,7 +81,12 @@ class KVCacheManager:
         storage = self._storage
         lc_id = storage._layer_to_life_cycle_ids[layer_id]
         pg_idx = storage.get_pool_group_index(lc_id)
-        return storage._levels[GPU_LEVEL].storage._pool_groups[pg_idx].num_slots
+        pool_group = storage._levels[GPU_LEVEL].storage._pool_groups[pg_idx]
+        num_slots = pool_group.num_slots
+        attr = storage.get_buffer_attr(layer_id, data_role)
+        pool_idx = attr.pool_index
+        slot_size = pool_group.slot_size[pool_idx]
+        return exact_div(slot_size, attr.size) * num_slots - exact_div(attr.offset, attr.size)
 
     # lora_task_id: match lora_task_id before matching any tokens.
     # stream: blocks are allocated and made ready in this stream. Later grow() also makes blocks ready in
