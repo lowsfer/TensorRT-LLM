@@ -71,6 +71,15 @@ def _view_fp8_as_uint8(buffer: torch.Tensor) -> torch.Tensor:
     return buffer
 
 
+@pytest.fixture(params=[False, True], ids=["scratch_reuse_disabled", "scratch_reuse_enabled"])
+def scratch_reuse_enabled(request, monkeypatch) -> bool:
+    if request.param:
+        monkeypatch.setenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "1")
+    else:
+        monkeypatch.delenv(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, raising=False)
+    return request.param
+
+
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(80000)
 class TestDeepseekV4CacheManager:
@@ -850,6 +859,7 @@ class TestDeepseekV4CacheManager:
         num_generation_steps: int,
         dtype: DataType,
         compressor_dtype: DataType,
+        scratch_reuse_enabled: bool,
     ):
         max_batch_size = len(prompt_lens)
         max_seq_len = max(prompt_lens) + num_generation_steps + 1
@@ -864,6 +874,7 @@ class TestDeepseekV4CacheManager:
             compressor_dtype=compressor_dtype,
             max_input_len=max_input_len,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         # Create requests and their cache values
         requests = list[LlmRequest]()
@@ -1076,7 +1087,7 @@ class TestDeepseekV4CacheManager:
             ctx_cache_manager.shutdown()
             gen_cache_manager.shutdown()
 
-    def test_dsv4_block_tables(self):
+    def test_dsv4_block_tables(self, scratch_reuse_enabled: bool):
         prompt_len = self.tokens_per_block * 2
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -1086,6 +1097,7 @@ class TestDeepseekV4CacheManager:
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         req = self._create_request(0, prompt_len)
         allocated = False
@@ -1190,7 +1202,7 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_copy_batch_block_offsets_matches_python_converter(self):
+    def test_copy_batch_block_offsets_matches_python_converter(self, scratch_reuse_enabled: bool):
         prompt_len = self.tokens_per_block * 2 + 1
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -1200,6 +1212,7 @@ class TestDeepseekV4CacheManager:
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         requests = []
         try:
@@ -1242,7 +1255,9 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_copy_batch_sliding_block_tables_matches_python_converter(self):
+    def test_copy_batch_sliding_block_tables_matches_python_converter(
+        self, scratch_reuse_enabled: bool
+    ):
         prompt_len = self.tokens_per_block * 2 + 1
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -1252,6 +1267,7 @@ class TestDeepseekV4CacheManager:
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         requests = []
         try:
@@ -1297,7 +1313,9 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_copy_batch_compress_block_tables_matches_python_converter(self):
+    def test_copy_batch_compress_block_tables_matches_python_converter(
+        self, scratch_reuse_enabled: bool
+    ):
         prompt_len = self.tokens_per_block * 2 + 1
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -1307,6 +1325,7 @@ class TestDeepseekV4CacheManager:
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         requests = []
         try:
@@ -1349,7 +1368,9 @@ class TestDeepseekV4CacheManager:
                 cache_manager.free_resources(req)
             cache_manager.shutdown()
 
-    def test_copy_batch_indexer_compress_block_tables_matches_python_converter(self):
+    def test_copy_batch_indexer_compress_block_tables_matches_python_converter(
+        self, scratch_reuse_enabled: bool
+    ):
         prompt_len = self.tokens_per_block * 2 + 1
         cache_manager, _ = self._create_deepseek_v4_cache_manager(
             tokens_per_block=self.tokens_per_block,
@@ -1359,6 +1380,7 @@ class TestDeepseekV4CacheManager:
             dtype=DataType.BF16,
             compressor_dtype=DataType.FLOAT,
         )
+        assert cache_manager.enable_swa_scratch_reuse == scratch_reuse_enabled
 
         requests = []
         try:
