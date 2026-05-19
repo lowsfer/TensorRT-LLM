@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import os
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -43,6 +47,10 @@ from .deepseek_v4 import (
     get_token_bytes,
     is_overlap_compressor,
 )
+
+# Keep DSV4 scratch reuse opt-in so per-layer block tables can be tested
+# without scratch-page remapping in the default path.
+DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV = "TRTLLM_DSV4_ENABLE_SWA_SCRATCH_REUSE"
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,11 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
         return PageIndexMode.PER_LAYER
     else:
         return PageIndexMode.SHARED
+
+
+def _enable_swa_scratch_reuse_from_env() -> bool:
+    value = os.environ.get(DSV4_ENABLE_SWA_SCRATCH_REUSE_ENV, "0")
+    return value.strip() == "1"
 
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
@@ -226,7 +239,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             mapping=mapping,
             dtype=dtype,
-            enable_swa_scratch_reuse=True,  # DSV4 enable scratch reuse by default
+            enable_swa_scratch_reuse=_enable_swa_scratch_reuse_from_env(),
             **kwargs,
         )
         self.is_vswa = True  # DeepSeek-V4 must has VSWA
