@@ -284,12 +284,12 @@ pytest tests/unittest/executor/test_stats_serializer.py -k peak_block_stats -vs
 
 ## Change 9: Event model, queue, hash compatibility, and public API
 
-Status: implemented and verified on 2026-07-01. The C++ manager now accepts
-and exposes the existing Python event manager through a narrow C++ event sink
-that acquires the GIL only for callbacks. The sink keeps the C++ BLAKE3 lookup
-key separate from the Python-compatible public event key, caches incremental
-SHA-256 keys to avoid quadratic prefix hashing, and passes all 35 event tests
-for v1, v2, and v2 SHA-256-64. The same 35 tests pass with the Python backend.
+Status: migrated to native C++ on 2026-07-02. The C++ manager owns the event
+model, bounded queue, lifecycle registry, coalescing, batching, blocking reads,
+and hash selection. V2 events reuse the radix tree's native BLAKE3 block key
+directly and identify it as `v2_blake3` (or `v2_blake3_64`); v1 events preserve
+the legacy 64-bit block-key hashing algorithm. The Python event manager remains
+available only with the explicit Python KV-cache-manager backend.
 
 ### Implementation
 
@@ -297,12 +297,12 @@ for v1, v2, and v2 SHA-256-64. The same 35 tests pass with the Python backend.
 - Preserve stored-event coalescing, removed-event batching, event IDs,
   blocking reads, iteration flush, per-layer-group windows, and attention-DP
   gather callbacks.
-- Support v1, v2, and v2 SHA-256-64 output modes.
-- Add a cross-backend golden test for root and chained block hashes. The event
-  hash must match the Python reference even if the internal radix-tree lookup
-  hash remains an implementation detail.
-- Expose a C++ event sink to the core. If the queue stays in Python, acquire
-  the GIL only at the sink boundary.
+- Support legacy v1 plus native `v2_blake3` and `v2_blake3_64` output modes.
+  Accept the old `v2_sha256` selector strings as compatibility aliases, while
+  reporting the actual BLAKE3 algorithm in emitted events.
+- Add golden tests for BLAKE3 root/chained block hashes and legacy v1 hashes.
+- Keep Python interaction only at the optional attention-DP gather callback;
+  event payloads are pickleable so MPI object gather remains supported.
 
 ### Targeted tests
 
