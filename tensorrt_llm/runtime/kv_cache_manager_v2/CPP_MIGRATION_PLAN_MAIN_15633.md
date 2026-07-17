@@ -286,8 +286,8 @@ pytest tests/unittest/executor/test_stats_serializer.py -k peak_block_stats -vs
 
 Status: migrated to native C++ on 2026-07-02. The C++ manager owns the event
 model, bounded queue, lifecycle registry, coalescing, batching, blocking reads,
-and hash selection. V2 events reuse the radix tree's native BLAKE3 block key
-directly and identify it as `v2_blake3` (or `v2_blake3_64`); v1 events preserve
+and hash selection. V2 events reuse the radix tree's native SHA-256 block key
+directly and identify it as `v2_sha256` (or `v2_sha256_64`); v1 events preserve
 the legacy 64-bit block-key hashing algorithm. The Python event manager remains
 available only with the explicit Python KV-cache-manager backend.
 
@@ -297,10 +297,10 @@ available only with the explicit Python KV-cache-manager backend.
 - Preserve stored-event coalescing, removed-event batching, event IDs,
   blocking reads, iteration flush, per-layer-group windows, and attention-DP
   gather callbacks.
-- Support legacy v1 plus native `v2_blake3` and `v2_blake3_64` output modes.
-  Accept the old `v2_sha256` selector strings as compatibility aliases, while
-  reporting the actual BLAKE3 algorithm in emitted events.
-- Add golden tests for BLAKE3 root/chained block hashes and legacy v1 hashes.
+- Support legacy v1 plus native `v2_sha256` and `v2_sha256_64` output modes,
+  reporting the SHA-256 algorithm in emitted events (byte-identical to the
+  Python backend's `hashlib.sha256` block keys).
+- Add golden tests for SHA-256 root/chained block hashes and legacy v1 hashes.
 - Keep Python interaction only at the optional attention-DP gather callback;
   event payloads are pickleable so MPI object gather remains supported.
 

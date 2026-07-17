@@ -259,7 +259,7 @@ _KVCache  (shared_ptr, held by Python via nanobind)
 | **9** | `_storage/_core.py` | `storage/core.h/cpp` | `SlotAllocator`, `PoolGroupBase`, `*CacheLevelStorage`, resize logic |
 | **10** | `_eviction_controller/` | `evictionController.h/cpp` | `LRUEvictionPolicy` with `std::list`; `PerLevelEvictionController` |
 | **11** | `_copy_engine.py` | `copyEngine.h/cpp` | `CopyEngine`, `StagingBuffer`; direct calls to existing copy functions |
-| **12** | `_block_radix_tree.py` | `blockRadixTree.h/cpp` | `Block`, `BlockRadixTree`; BLAKE3 for token sequence hashing |
+| **12** | `_block_radix_tree.py` | `blockRadixTree.h/cpp` | `Block`, `BlockRadixTree`; SHA-256 for token sequence hashing |
 | **13** | `_page.py` | `page.h/cpp` | `Page`, `CommittedPage`, `_PageHolder`, lock types; state machine |
 | **14** | `_storage_manager.py` | `storageManager.h/cpp` | `StorageManager`, migration/eviction orchestration |
 | **15** | `_core/_moving_average.py` | `movingAverage.h` | `MovingAverage`; trivial, header-only |
@@ -339,30 +339,29 @@ new list and takes ownership via a new `shared_ptr`).
 
 ### Hashing for block keys
 `_block_radix_tree.py` uses Python's `hashlib.sha256` to hash token sequences into block keys.
-In C++, use **BLAKE3** via the [`blake3`](https://github.com/BLAKE3-team/BLAKE3/tree/master/c)
-C implementation (CC0/Apache-2.0, no license concerns). OpenSSL/libcrypto are **not** existing
-dependencies of TRT-LLM's C++ code, so adding them would be unnecessary overhead.
-BLAKE3 is also significantly faster than SHA-256 for this use case.
+In C++, use **SHA-256** so the C++ backend produces byte-identical block keys to the Python
+implementation (both hash the same little-endian token encoding). OpenSSL/libcrypto are **not**
+existing dependencies of TRT-LLM's C++ code, and linking them would complicate the manylinux
+wheel; instead we vendor Bitcoin Core's self-contained MIT-licensed SHA-256 (scalar core plus
+runtime dispatch to x86 SHA-NI, ARMv8 crypto, and SSE4/AVX2) under `3rdparty/sha256/`
+(see `3rdparty/sha256/README.md` for provenance).
 
 ```cmake
-# Add directly to the existing bindings target — no library dependency needed:
-target_sources(bindings PRIVATE
-    third_party/blake3/blake3.c
-    third_party/blake3/blake3_dispatch.c
-    third_party/blake3/blake3_portable.c
-)
-target_include_directories(bindings PRIVATE third_party/blake3)
+# Vendored as-received under 3rdparty/sha256; include root preserves the upstream
+# <crypto/...> / <compat/...> include paths. See
+# cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/CMakeLists.txt for the full
+# per-arch flag/macro wiring (SSE-NI/AVX2/ARM crypto, C++20 for the vendored TUs).
+target_include_directories(<target> PRIVATE ${REPO_ROOT}/3rdparty/sha256)
 ```
 
 ```cpp
-#include "blake3.h"
+#include "crypto/sha256.h"
 
-std::array<uint8_t, BLAKE3_OUT_LEN> hashTokens(std::span<TokenIdExt const> tokens) {
-    blake3_hasher hasher;
-    blake3_hasher_init(&hasher);
-    blake3_hasher_update(&hasher, tokens.data(), tokens.size_bytes());
-    std::array<uint8_t, BLAKE3_OUT_LEN> out;
-    blake3_hasher_finalize(&hasher, out.data(), BLAKE3_OUT_LEN);
+std::array<uint8_t, CSHA256::OUTPUT_SIZE> hashTokens(std::span<TokenIdExt const> tokens) {
+    CSHA256 hasher;
+    hasher.Write(reinterpret_cast<unsigned char const*>(tokens.data()), tokens.size_bytes());
+    std::array<uint8_t, CSHA256::OUTPUT_SIZE> out;
+    hasher.Finalize(out.data());
     return out;
 }
 ```
