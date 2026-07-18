@@ -219,6 +219,7 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
+        max_util_for_resume: float = 1.0,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -243,9 +244,12 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
-        constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
+        # Constraints stay feasibility floors even under an explicit initial pool
+        # ratio (a share below what a declared batch needs is clamped up), and the
+        # floors are scaled by 1/max_util_for_resume because _KVCache.resume rejects
+        # any pool group above that utilization. Mirrors PR #16269.
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints_for_min_slots, tokens_per_block, swa_scratch_reuse
+            constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
 
         # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
@@ -907,11 +911,18 @@ class StorageManager:
         constraints: list[BatchDesc],
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
+        max_util_for_resume: float = 1.0,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
         All returned elements are positive.
         """
+        # The resume gate only binds for values in (0, 1): with 0 only the first
+        # resume of an empty pool passes, so no finite floor helps; values >= 1 never
+        # trigger since utilization cannot exceed 1. Scale floors only in the binding
+        # range so 0 doesn't divide by zero and >1 doesn't shrink floors.
+        if not (0.0 < max_util_for_resume < 1.0):
+            max_util_for_resume = 1.0
         max_slots = filled_list(0, self.num_pool_groups)
 
         def swa_floor_blocks(lc: AttnLifeCycle) -> int:
@@ -937,7 +948,8 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
-                max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
+                scaled = math.ceil(slots[pg_idx] / max_util_for_resume)
+                max_slots[pg_idx] = max(max_slots[pg_idx], scaled)
         return max_slots
 
     def _compute_slots_for_batch(
