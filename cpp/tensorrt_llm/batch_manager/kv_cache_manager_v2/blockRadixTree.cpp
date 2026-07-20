@@ -147,11 +147,45 @@ Hasher& Hasher::update(TokenIdExt const& tokenExt)
 
 Hasher& Hasher::update(TokenIdExt const* tokens, size_t count)
 {
-    // Python uses array("Q", data).tobytes() to reduce per-token interpreter
-    // overhead.  In C++ the compiler inlines each update() call, so the loop
-    // is already optimal; batching would only add a heap allocation.
+    // Batch plain token ids into a contiguous little-endian buffer and feed
+    // SHA-256 with one Write per 4KB instead of one per token: each 8-byte
+    // Write pays the incremental buffering/transform bookkeeping, which
+    // dominates once the transform itself uses the ARMv8 SHA extensions.
+    // The byte stream is identical to the per-token path, so digests are
+    // unchanged.
+    constexpr size_t kBatchTokens = 512;
+    unsigned char buf[kBatchTokens * 8];
+    size_t n = 0;
+    auto flush = [&]
+    {
+        if (n != 0)
+        {
+            mState.Write(buf, n * 8);
+            n = 0;
+        }
+    };
     for (size_t i = 0; i < count; ++i)
-        update(tokens[i]);
+    {
+        if (auto const* id = std::get_if<TokenId>(&tokens[i]))
+        {
+            auto const u = static_cast<uint64_t>(static_cast<int64_t>(*id));
+            unsigned char* p = buf + n * 8;
+            for (int b = 0; b < 8; ++b)
+            {
+                p[b] = static_cast<unsigned char>((u >> (8 * b)) & 0xFFU);
+            }
+            if (++n == kBatchTokens)
+            {
+                flush();
+            }
+        }
+        else
+        {
+            flush();
+            update(tokens[i]);
+        }
+    }
+    flush();
     return *this;
 }
 
