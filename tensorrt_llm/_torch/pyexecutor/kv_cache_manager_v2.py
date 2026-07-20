@@ -16,6 +16,7 @@ import hashlib
 import math
 import os
 import sys
+from array import array
 from collections import OrderedDict, defaultdict
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
@@ -1972,15 +1973,31 @@ class KVCacheManagerV2(BaseResourceManager):
         if req.is_first_context_chunk:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
-                all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
-                if self.enable_block_reuse:
-                    tokens = self._augment_tokens_for_block_reuse(
-                        all_tokens, req, end=len(all_tokens) - 1
-                    )
+                text_only = (
+                    req.multimodal_hashes is None
+                    or req.multimodal_positions is None
+                    or req.multimodal_lengths is None
+                )
+                get_tokens_bytes = getattr(req, "get_tokens_bytes", None)
+                if text_only and get_tokens_bytes is not None:
+                    # Zero-per-element path: raw int32 buffer from the C++
+                    # request (one memcpy), sliced as a memoryview. Skips the
+                    # list-of-PyLong round trip entirely; augmentation is a
+                    # no-op for text-only requests.
+                    tokens_view = memoryview(get_tokens_bytes(DEFAULT_BEAM_INDEX)).cast("i")
+                    num_all_tokens = len(tokens_view)
+                    tokens = tokens_view[: num_all_tokens - 1] if self.enable_block_reuse else None
                 else:
-                    tokens = None
+                    all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
+                    num_all_tokens = len(all_tokens)
+                    if self.enable_block_reuse:
+                        tokens = self._augment_tokens_for_block_reuse(
+                            all_tokens, req, end=num_all_tokens - 1
+                        )
+                    else:
+                        tokens = None
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -3280,6 +3297,15 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
+        if type(input_tokens) is list:
+            # Pack plain-int token lists into a contiguous int64 buffer so the
+            # nanobind boundary takes the buffer-protocol fast path instead of
+            # per-element casting. Multimodal sequences (bytes digests mixed
+            # in) raise TypeError and keep the generic list path.
+            try:
+                input_tokens = array("q", input_tokens)
+            except TypeError:
+                pass
         kv_cache = self.impl.create_kv_cache(
             ReuseScope(lora_id=lora_task_id, salt=salt_int),
             input_tokens,

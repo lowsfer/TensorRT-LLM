@@ -101,6 +101,20 @@ void initBindings(nb::module_& m)
         .def("get_token", &GenLlmReq::getToken, nb::arg("beam"), nb::arg("pos"))
         .def("get_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getTokens, nb::const_), nb::arg("beam"))
         .def("get_tokens", nb::overload_cast<>(&GenLlmReq::getTokens, nb::const_))
+        .def(
+            "get_tokens_bytes",
+            [](GenLlmReq const& self, GenLlmReq::SizeType32 beam)
+            {
+                // Raw little-endian int32 token buffer (one memcpy). Callers
+                // wrap it in memoryview(...).cast('i') for a zero-per-element
+                // path into KVv2 create_kv_cache, avoiding the list-of-PyLong
+                // materialization of get_tokens (~20 ns/token both ways).
+                auto const& toks = self.getTokens(beam);
+                static_assert(sizeof(GenLlmReq::TokenIdType) == 4, "token buffer format assumes int32 tokens");
+                return nb::bytes(
+                    reinterpret_cast<char const*>(toks.data()), toks.size() * sizeof(GenLlmReq::TokenIdType));
+            },
+            nb::arg("beam"))
         .def("get_last_tokens", nb::overload_cast<GenLlmReq::SizeType32>(&GenLlmReq::getLastTokens), nb::arg("beam"))
         .def("get_last_tokens", nb::overload_cast<>(&GenLlmReq::getLastTokens))
         .def("get_beam_width_by_iter", &GenLlmReq::getBeamWidthByIter, nb::arg("for_next_iteration") = false)
