@@ -65,8 +65,69 @@ namespace tensorrt_llm::nanobind::batch_manager
 static std::vector<kv::TokenIdExt> castTokenIterable(nb::handle tokens)
 {
     std::vector<kv::TokenIdExt> vec;
+
+    // Fast path: contiguous int64 buffer (array('q'), 1-D int64 numpy/torch).
+    // Skips the per-element iterator/isinstance/cast machinery entirely.
+    // Text-only prompts take this path; multimodal prompts (digest bytes mixed
+    // into the sequence) fall through to the generic iterable path below.
+    if (!nb::isinstance<nb::list>(tokens) && !nb::isinstance<nb::tuple>(tokens))
+    {
+        Py_buffer view;
+        if (PyObject_GetBuffer(tokens.ptr(), &view, PyBUF_CONTIG_RO | PyBUF_FORMAT) == 0)
+        {
+            bool const isInt64 = view.itemsize == 8 && view.format != nullptr
+                && (view.format[0] == 'q' || view.format[0] == 'l') && view.format[1] == '\0';
+            bool const isInt32 = view.itemsize == 4 && view.format != nullptr && view.format[0] == 'i'
+                && view.format[1] == '\0';
+            if (isInt64)
+            {
+                auto const* data = static_cast<int64_t const*>(view.buf);
+                size_t const n = static_cast<size_t>(view.len) / sizeof(int64_t);
+                vec.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    vec.emplace_back(static_cast<kv::TokenId>(data[i]));
+                }
+                PyBuffer_Release(&view);
+                return vec;
+            }
+            if (isInt32)
+            {
+                auto const* data = static_cast<int32_t const*>(view.buf);
+                size_t const n = static_cast<size_t>(view.len) / sizeof(int32_t);
+                vec.reserve(n);
+                for (size_t i = 0; i < n; ++i)
+                {
+                    vec.emplace_back(static_cast<kv::TokenId>(data[i]));
+                }
+                PyBuffer_Release(&view);
+                return vec;
+            }
+            PyBuffer_Release(&view);
+        }
+        else
+        {
+            PyErr_Clear();
+        }
+    }
+
+    if (PySequence_Check(tokens.ptr()))
+    {
+        vec.reserve(static_cast<size_t>(nb::len(tokens)));
+    }
     for (auto item : nb::cast<nb::iterable>(tokens))
     {
+        // Fast path for plain ints (the overwhelmingly common token type).
+        if (PyLong_CheckExact(item.ptr()))
+        {
+            long long const v = PyLong_AsLongLong(item.ptr());
+            if (v == -1 && PyErr_Occurred())
+            {
+                throw nb::python_error();
+            }
+            vec.emplace_back(static_cast<kv::TokenId>(v));
+            continue;
+        }
         if (nb::isinstance<nb::bytes>(item))
         {
             auto b = nb::cast<nb::bytes>(item);
