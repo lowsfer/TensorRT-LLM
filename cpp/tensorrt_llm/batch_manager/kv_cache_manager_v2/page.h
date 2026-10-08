@@ -72,11 +72,7 @@ public:
     // Prevent the page from being dropped (returns/creates a PageHolder).
     SharedPtr<PageHolder> hold();
 
-    //! Return the lock destination for read-only use, preserving pages already at the hot GPU level.
-    //! Cold sparse pages use host memory; callers must force writable pages to GPU.
-    [[nodiscard]] CacheLevel queryLockLevel() const;
-
-    // Acquire a shared lock at the current level. The caller handles any migration.
+    // Acquire a shared lock (migrates to GPU if needed).
     // skip_wait: caller guarantees the page is ready on kvCache's stream.
     SharedPageLock lock(
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait = false);
@@ -252,7 +248,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// BatchedLockTarget — page, owner, and intended storage level for a lock.
+// BatchedLockTarget — input for batched_lock_to_gpu.
 // ---------------------------------------------------------------------------
 struct BatchedLockTarget
 {
@@ -260,20 +256,19 @@ struct BatchedLockTarget
     BeamIndex beamIndex;
     BlockOrdinal ordinal;
     LifeCycleId lifeCycle;
-    CacheLevel cacheLevel = kHotLevel;
 };
 
 // ---------------------------------------------------------------------------
-// batchedLockPages — restore pages to their intended levels, then lock them.
+// batchedLockToGpu — migrate pages to GPU then lock them.
 // Returns one SharedPageLock per target.
-// Only promotes cold pages; GPU-to-host offload has a separate ownership handoff.
+// Mirrors Python's batched_lock_to_gpu().
 // ---------------------------------------------------------------------------
-std::vector<SharedPageLock> batchedLockPages(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
+std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
 // ---------------------------------------------------------------------------
 // ScratchSlotLock — manages a scratch slot for SWA prefill memory reuse.
 // Wraps a Slot with owner (KvCache) and lifecycle references.
-// GPU-only: on destruction, releases the slot back to the GPU storage pool.
+// On destruction, releases the slot back to the StorageManager.
 // Mirrors _page.py::ScratchSlotLock.
 // ---------------------------------------------------------------------------
 class ScratchSlotLock

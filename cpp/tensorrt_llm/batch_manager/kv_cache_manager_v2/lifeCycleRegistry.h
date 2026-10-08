@@ -40,7 +40,6 @@ struct AttnLifeCycle
 {
     std::optional<int> windowSize; // nullopt = no sliding window
     int numSinkBlocks = 0;         // divUp(numSinkTokens, tokensPerBlock)
-    bool isSparse = false;
 
     HalfOpenRange<BlockOrdinal> getStaleRange(int historyLength, int tokensPerBlock) const
     {
@@ -57,31 +56,24 @@ struct AttnLifeCycle
 
     bool operator==(AttnLifeCycle const& o) const noexcept
     {
-        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks && isSparse == o.isSparse;
+        return windowSize == o.windowSize && numSinkBlocks == o.numSinkBlocks;
     }
 
     bool operator<(AttnLifeCycle const& o) const noexcept
     {
         if (windowSize != o.windowSize)
-        {
             return windowSize < o.windowSize;
-        }
-        if (numSinkBlocks != o.numSinkBlocks)
-        {
-            return numSinkBlocks < o.numSinkBlocks;
-        }
-        return isSparse < o.isSparse;
+        return numSinkBlocks < o.numSinkBlocks;
     }
 
-    static AttnLifeCycle make(
-        std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock, bool isSparse = false)
+    static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock)
     {
         TLLM_CHECK_DEBUG(tokensPerBlock > 0);
         TLLM_CHECK_DEBUG(!ws.has_value() || *ws > 0);
         TLLM_CHECK_DEBUG(!numSinkTokens.has_value() || *numSinkTokens >= 0);
         TLLM_CHECK_DEBUG((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
-        return AttnLifeCycle{ws, sinkBlocks, isSparse};
+        return AttnLifeCycle{ws, sinkBlocks};
     }
 };
 

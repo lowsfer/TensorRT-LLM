@@ -186,7 +186,7 @@ public:
 
     // ---- State machine -----------------------------------------------------
 
-    // Resume: check utilization and lock active pages at their required storage levels.
+    // Resume: check utilization and lock all pages to GPU.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
     // Returns false if utilization too high or out of memory.
     bool resume(std::optional<CUstream> stream = std::nullopt);
@@ -470,16 +470,12 @@ public:
 
 private:
     friend class KvCacheIntrospection;
-    friend std::vector<SharedPageLock> batchedLockPages(
+    friend std::vector<SharedPageLock> batchedLockToGpu(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
-    // Activate: lock active pages at their required levels. mCudaStream must already be set.
+    // Activate: lock all pages to GPU. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
-
-    // Keep cold sparse history (and immutable reuse sources) in host memory.
-    // Writable pages require GPU storage; GPU history stays there until explicitly offloaded.
-    CacheLevel _lockLevel(Page const& page, BlockOrdinal ordinal) const;
 
     // Internal helpers.
     // Turn the per-block cache levels observed while holding the matched pages into logical token
@@ -518,7 +514,6 @@ private:
         BeamIndex beamIdx;
         LifeCycleId lcId;
         SharedPtr<PageHolder> holder;
-        CacheLevel cacheLevel;
     };
 
     // Unlock stale SWA blocks. Returns backup holders for rollback.

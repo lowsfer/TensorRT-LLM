@@ -77,21 +77,16 @@ LifeCycleId = NewType("LifeCycleId", int)
 LayerGroupId: TypeAlias = LifeCycleId
 
 class AttnLifeCycle:
-    """The attention life cycle, keyed by its window, sink-token shape, and sparsity."""
+    """The attention life cycle, keyed by its sliding-window and sink-token shape."""
 
     @staticmethod
     def make(
-        window_size: int | None,
-        num_sink_tokens: int | None,
-        tokens_per_block: int,
-        is_sparse: bool = False,
+        window_size: int | None, num_sink_tokens: int | None, tokens_per_block: int
     ) -> "AttnLifeCycle": ...
     @property
     def window_size(self) -> int | None: ...
     @property
     def num_sink_blocks(self) -> int: ...
-    @property
-    def is_sparse(self) -> bool: ...
     def get_stale_range(self, history_length: int, tokens_per_block: int) -> HalfOpenRange: ...
 
 CacheLevel = NewType("CacheLevel", int)
@@ -220,7 +215,6 @@ class BufferConfig:
     role: DataRole
     size: int
     tokens_per_block_override: int | None = None
-    is_sparse: bool = False
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
