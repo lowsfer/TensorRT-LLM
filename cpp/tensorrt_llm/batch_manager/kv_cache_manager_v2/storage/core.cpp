@@ -370,9 +370,18 @@ namespace
 //! deepseek_v4_indexer_compress, which stays in HBM.
 constexpr char kUvmRolePrefix[] = "deepseek_v4_compress";
 
+//! Roles that must stay in HBM. The indexer scores every candidate block each step, so it
+//! has no working set to migrate and would only compete with COMPRESS for residency.
+constexpr char kUvmExcludedRole[] = "deepseek_v4_indexer_compress";
+
 bool roleIsUvm(DataRole const& role)
 {
     return std::string_view{role}.substr(0, std::string_view{kUvmRolePrefix}.size()) == kUvmRolePrefix;
+}
+
+bool roleIsUvmExcluded(DataRole const& role)
+{
+    return std::string_view{role} == kUvmExcludedRole;
 }
 
 bool uvmEnabled()
@@ -413,6 +422,8 @@ bool poolUsesUvm(SlotDesc const& slotDesc, PoolIndex poolIdx)
     {
         return false;
     }
+    bool uvm = false;
+    bool excluded = false;
     for (auto const& variant : slotDesc.variants)
     {
         if (poolIdx >= variant.coalescedBuffers.size())
@@ -421,13 +432,17 @@ bool poolUsesUvm(SlotDesc const& slotDesc, PoolIndex poolIdx)
         }
         for (auto const& bid : variant.coalescedBuffers[poolIdx].bufferIds)
         {
-            if (roleIsUvm(bid.role))
-            {
-                return true;
-            }
+            uvm = uvm || roleIsUvm(bid.role);
+            excluded = excluded || roleIsUvmExcluded(bid.role);
         }
     }
-    return false;
+    // Buffers coalesce by size, so a configuration where COMPRESS and INDEXER_COMPRESS
+    // happen to match would put both in one pool and silently migrate the index. Refuse
+    // rather than run: the symptom would be a performance result that looks plausible.
+    TLLM_CHECK_WITH_INFO(!(uvm && excluded),
+        "TLLM_KVCM2_UVM_SPARSE: a pool holds both an offloadable and a resident DeepSeek-V4 role; "
+        "their buffer sizes coincide in this configuration and they cannot share residency policy");
+    return uvm;
 }
 
 bool slotDescHasUvmPool(SlotDesc const& slotDesc)
