@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -27,8 +28,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -398,6 +402,53 @@ bool uvmEnabled()
 //! Grace/C2C signature. Fail loudly rather than silently falling back: on a PCIe part
 //! this pool would still run, at fault-and-migrate speed, and quietly produce numbers
 //! that mean nothing.
+//! Reads an nvidia_uvm module parameter. Returns nullopt when the file is absent or
+//! unreadable, which is itself worth reporting: it usually means the open-source driver
+//! layout differs, not that the feature is off.
+std::optional<std::string> readUvmParam(char const* name)
+{
+    std::ifstream f(std::string{"/sys/module/nvidia_uvm/parameters/"} + name);
+    if (!f)
+    {
+        return std::nullopt;
+    }
+    std::string value;
+    std::getline(f, value);
+    return value;
+}
+
+//! Reports the environment the experiment depends on, once per process.
+//!
+//! Logged at warning level deliberately. Every condition here degrades silently: without
+//! coherence or access counters the run still completes, just at fault-and-migrate speed,
+//! and the result reads as "UVM is slow" rather than "UVM was never engaged".
+void logUvmEnvironment(int device, int usesHostPageTables)
+{
+    TLLM_LOG_WARNING("KVCM2 UVM: experimental managed-memory path ACTIVE (TLLM_KVCM2_UVM_SPARSE=1)");
+    TLLM_LOG_WARNING(
+        "KVCM2 UVM:   device=%d coherent(pageableMemoryAccessUsesHostPageTables)=%d", device, usesHostPageTables);
+    TLLM_LOG_WARNING("KVCM2 UVM:   oversize ratio=%.2f (TLLM_KVCM2_UVM_OVERSIZE)", uvmOversizeRatio());
+
+    // -1 means the driver's default policy, 0 disables migration, 1 or more enables it.
+    for (char const* param : {"uvm_perf_access_counter_mimc_migration_enable",
+             "uvm_perf_access_counter_momc_migration_enable", "uvm_perf_access_counter_batch_count"})
+    {
+        auto const value = readUvmParam(param);
+        if (!value.has_value())
+        {
+            TLLM_LOG_WARNING("KVCM2 UVM:   %s=<unreadable>", param);
+            continue;
+        }
+        TLLM_LOG_WARNING("KVCM2 UVM:   %s=%s", param, value->c_str());
+        if (*value == "0")
+        {
+            TLLM_LOG_WARNING(
+                "KVCM2 UVM:   ^ access-counter migration is DISABLED; pages will not migrate on "
+                "access counts and this measurement will not mean what it appears to");
+        }
+    }
+}
+
 void checkCoherentPlatform()
 {
     int device = 0;
@@ -409,6 +460,10 @@ void checkCoherentPlatform()
         usesHostPageTables = 0;
         cudaGetLastError();
     }
+
+    static std::once_flag logOnce;
+    std::call_once(logOnce, [&] { logUvmEnvironment(device, usesHostPageTables); });
+
     TLLM_CHECK_WITH_INFO(usesHostPageTables != 0,
         "TLLM_KVCM2_UVM_SPARSE requires a hardware-coherent CPU-GPU link (Grace C2C); "
         "this device does not use host page tables");
@@ -491,6 +546,10 @@ UvmSlotPool::UvmSlotPool(size_t slotSize, SlotCount numSlots)
         mBase, mCapacityBytes, cudaMemAdviseSetAccessedBy, cudaMemLocation{cudaMemLocationTypeDevice, device}));
 
     mNumSlots = numSlots;
+
+    TLLM_LOG_WARNING("KVCM2 UVM:   pool backed by cudaMallocManaged: slotSize=%zu numSlots=%ld bytes=%zu (%.2f GiB)",
+        slotSize, slotCountToSizeT(numSlots), mCapacityBytes,
+        static_cast<double>(mCapacityBytes) / (1024.0 * 1024.0 * 1024.0));
 }
 
 UvmSlotPool::~UvmSlotPool()
