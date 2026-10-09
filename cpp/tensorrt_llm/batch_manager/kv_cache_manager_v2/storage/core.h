@@ -300,20 +300,29 @@ public:
 
 private:
     void* mBase{nullptr};
-    size_t mCapacityBytes{0}; // allocated, including oversize headroom
-    SlotCount mNumSlots{0};   // slots currently handed out
+    size_t mCapacityBytes{0};
+    SlotCount mNumSlots{0};
 };
 
-// Whether the UVM path is enabled and this pool group should use it.
-// True only when TLLM_KVCM2_UVM_SPARSE=1 and the group carries a sparse DeepSeek-V4 role.
-[[nodiscard]] bool useUvmForSlotDesc(SlotDesc const& slotDesc);
+//! Whether one pool within a group should be managed rather than VMM-backed.
+//!
+//! Keyed on the roles the pool carries, so COMPRESS and COMPRESS_BLOCK_SCALE become
+//! managed while INDEXER_COMPRESS, which shares their group and slot ids, stays in HBM.
+//! The indexer scores every candidate block each step, so it must be resident; the
+//! point of the experiment is to offload the large per-token buffers beside it.
+[[nodiscard]] bool poolUsesUvm(SlotDesc const& slotDesc, PoolIndex poolIdx);
 
-// Slot-count multiplier for a UVM pool group; TLLM_KVCM2_UVM_OVERSIZE, default 4.0.
-//
-// Applies to the whole group, so the VMM-backed pools beside the managed one grow too
-// and consume that much more real HBM. That is the intended trade for DeepSeek-V4: the
-// group's other pool is INDEXER_COMPRESS at ~132 B/token against COMPRESS's ~576, so
-// carrying it along costs roughly a fifth again of the sparse data itself.
+//! Whether any pool in the group is managed, and the group therefore oversized.
+[[nodiscard]] bool slotDescHasUvmPool(SlotDesc const& slotDesc);
+
+//! Slot-count multiplier for a group containing a managed pool; TLLM_KVCM2_UVM_OVERSIZE,
+//! default 4.0.
+//!
+//! Applied to the group rather than to one pool because a slot id spans every pool in the
+//! group: one slot is one block's COMPRESS page *and* its INDEXER_COMPRESS page, and
+//! selection cannot score history it has no index for. Growing the indexer alongside is
+//! the cost of holding that much history, not overhead -- it is the resident index that
+//! buys the offload.
 [[nodiscard]] double uvmOversizeRatio();
 
 // ---------------------------------------------------------------------------
@@ -446,10 +455,11 @@ protected:
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
-    //! useUvm swaps GpuSlotPool for UvmSlotPool across the whole group. Per-group rather
-    //! than per-pool so every pool a lifecycle addresses keeps one allocation scheme.
+    //! uvmSlotDesc, when non-null, selects UvmSlotPool per pool via poolUsesUvm(). The
+    //! group then mixes managed and VMM pools, which is the point: they share slot ids
+    //! but not residency policy.
     GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
-        PooledPhysMemAllocator& physMemAllocator, bool useUvm = false);
+        PooledPhysMemAllocator& physMemAllocator, SlotDesc const* uvmSlotDesc = nullptr);
 };
 
 class HostPoolGroup : public PoolGroupBase
