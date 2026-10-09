@@ -459,6 +459,12 @@ bool KvCacheManager::resize(CacheLevel level, size_t quota, bool bestEfforts)
             "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
     if (bestEfforts)
         throw std::runtime_error("best_efforts resize not implemented");
+    // Checked before the try below, which turns failures into a false return: a managed
+    // pool is allocated once, so a quota change is a caller error rather than a resize
+    // that merely did not fit, and it should not be reported as one.
+    TLLM_CHECK_WITH_INFO(!(mStorage->hasUvmPool(level) && quota != getQuota(level)),
+        "cache level %d holds a managed pool and was sized once at construction; its quota cannot change",
+        level.value());
     try
     {
         _adjustLevel(level, quota);
@@ -1056,6 +1062,12 @@ void KvCacheManager::adjust()
         TLLM_CHECK_WITH_INFO(kvc->status() == KvCache::Status::SUSPENDED,
             "level adjustment requires every KvCache to be SUSPENDED: _adjustLevel may "
             "defragment, which relocates pages and invalidates indices an ACTIVE cache holds");
+
+    // Rebalancing redistributes slots between pool groups, which a managed pool cannot
+    // follow: its allocation is fixed and the oversize ratio it was built with would no
+    // longer describe it.
+    TLLM_CHECK_WITH_INFO(
+        !mStorage->anyUvmPool(), "a managed pool is configured; pool ratios are fixed and cannot be adjusted");
 
     CacheLevel numLevels = mStorage->numCacheLevels();
     for (CacheLevel level{0}; level < numLevels; ++level)

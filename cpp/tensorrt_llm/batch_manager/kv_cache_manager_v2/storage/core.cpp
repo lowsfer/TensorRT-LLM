@@ -842,6 +842,7 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
             ? slotCountValueFromSize(
                 static_cast<size_t>(static_cast<double>(slotCountToSizeT(slotCountList[pgIdx])) * uvmOversizeRatio()))
             : slotCountList[pgIdx];
+        mHasUvmPool = mHasUvmPool || useUvm;
         mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
             numSlots, slotDesc.slotSizeList(), mPhysMemAllocator, useUvm ? &slotDesc : nullptr));
     }

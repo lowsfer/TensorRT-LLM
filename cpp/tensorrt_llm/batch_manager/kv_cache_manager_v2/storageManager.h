@@ -247,6 +247,26 @@ public:
         return lvl == numCacheLevels() - 1;
     }
 
+    //! Whether any pool at this level is managed memory. Such a level is sized once and
+    //! neither resized nor rebalanced; see KvCacheManager::resize and ::adjust.
+    [[nodiscard]] bool hasUvmPool(CacheLevel lvl) const noexcept
+    {
+        return mLevels.at(lvl).storage->hasUvmPool();
+    }
+
+    //! Whether any level holds a managed pool.
+    [[nodiscard]] bool anyUvmPool() const noexcept
+    {
+        for (CacheLevel lvl{0}; lvl < numCacheLevels(); ++lvl)
+        {
+            if (hasUvmPool(lvl))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     PoolGroupIndex getPoolGroupIndex(CacheLevel level, LifeCycleId lc) const;
     PoolGroupIndex getPoolGroupIndex(LifeCycleId lc) const;
     PoolIndex numPools(CacheLevel level, PoolGroupIndex pgIdx) const;

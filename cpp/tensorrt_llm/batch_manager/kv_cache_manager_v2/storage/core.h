@@ -487,6 +487,13 @@ public:
 
     virtual CacheTier cacheTier() const noexcept = 0;
 
+    //! Whether any pool at this level is managed memory whose residency the driver owns.
+    //! Such a level is sized once at construction and cannot be resized or rebalanced.
+    [[nodiscard]] virtual bool hasUvmPool() const noexcept
+    {
+        return false;
+    }
+
     PoolGroupIndex numPoolGroups() const noexcept
     {
         return mPoolGroups.size();
@@ -627,6 +634,11 @@ public:
         return CacheTier::GPU_MEM;
     }
 
+    [[nodiscard]] bool hasUvmPool() const noexcept override
+    {
+        return mHasUvmPool;
+    }
+
     size_t poolSizeGranularity() const noexcept override
     {
         return mPhysMemAllocator.physMemSize();
@@ -634,6 +646,7 @@ public:
 
 private:
     PooledPhysMemAllocator& mPhysMemAllocator;
+    bool mHasUvmPool{false};
 };
 
 class HostCacheLevelStorage : public CacheLevelStorage
