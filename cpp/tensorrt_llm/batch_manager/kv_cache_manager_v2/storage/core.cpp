@@ -432,16 +432,14 @@ double uvmOversizeRatio()
     return ratio;
 }
 
-UvmSlotPool::UvmSlotPool(size_t slotSize, SlotCount numSlots, double oversizeRatio)
+UvmSlotPool::UvmSlotPool(size_t slotSize, SlotCount numSlots)
     : SlotPoolBase(slotSize)
 {
     checkCoherentPlatform();
 
-    // Sized once for the whole run: the driver, not this class, decides what is resident,
-    // so there is nothing to grow later. resize() only moves the handed-out slot count.
-    size_t const requested = slotCountToSizeT(numSlots) * slotSize;
-    mCapacityBytes = static_cast<size_t>(static_cast<double>(requested) * oversizeRatio);
-    mCapacityBytes = std::max(mCapacityBytes, requested);
+    // Sized for the slot count the group was given, which already carries the oversize
+    // multiplier. The driver, not this class, decides what of it is resident.
+    mCapacityBytes = slotCountToSizeT(numSlots) * slotSize;
 
     TLLM_CUDA_CHECK(cudaMallocManaged(&mBase, mCapacityBytes));
 
@@ -477,7 +475,7 @@ void UvmSlotPool::destroy()
 void UvmSlotPool::resize(SlotCount newNumSlots)
 {
     TLLM_CHECK_WITH_INFO(slotCountToSizeT(newNumSlots) * mSlotSize <= mCapacityBytes,
-        "UvmSlotPool::resize beyond the oversized allocation; raise TLLM_KVCM2_UVM_OVERSIZE");
+        "UvmSlotPool::resize beyond the managed allocation; raise TLLM_KVCM2_UVM_OVERSIZE");
     mNumSlots = newNumSlots;
 }
 
@@ -696,10 +694,9 @@ GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const
 {
     if (useUvm)
     {
-        double const oversize = uvmOversizeRatio();
         for (size_t sz : slotSizeList)
         {
-            mPools.push_back(std::make_unique<UvmSlotPool>(sz, numSlots, oversize));
+            mPools.push_back(std::make_unique<UvmSlotPool>(sz, numSlots));
         }
         return;
     }
@@ -793,8 +790,16 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(),
-            mPhysMemAllocator, useUvmForSlotDesc(slotDescList[pgIdx])));
+        bool const useUvm = useUvmForSlotDesc(slotDescList[pgIdx]);
+        // The multiplier applies to the group, not to the managed pool alone: one slot id
+        // addresses every pool in a group, so their slot counts cannot diverge. The
+        // VMM-backed pools beside the managed one therefore grow in real GPU memory.
+        SlotCount const numSlots = useUvm
+            ? slotCountValueFromSize(
+                static_cast<size_t>(static_cast<double>(slotCountToSizeT(slotCountList[pgIdx])) * uvmOversizeRatio()))
+            : slotCountList[pgIdx];
+        mPoolGroups.push_back(
+            std::make_unique<GpuPoolGroup>(numSlots, slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator, useUvm));
     }
 }
 

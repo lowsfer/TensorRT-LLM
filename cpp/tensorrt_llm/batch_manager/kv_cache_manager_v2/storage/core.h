@@ -272,8 +272,7 @@ private:
 // Backs a pool with cudaMallocManaged and sets cudaMemAdviseSetAccessedBy for the
 // device, which on a hardware-coherent (C2C) platform switches the driver from
 // fault-and-migrate to access-counter migration: hot pages move to HBM on their own
-// and cold pages are evicted back to host under memory pressure. The allocation is
-// deliberately oversized relative to the slot count so that pressure exists.
+// and cold pages are evicted back to host under memory pressure.
 //
 // cudaMemAdviseSetPreferredLocation is deliberately NOT set. Pointing it at the host
 // prevents counter migration, which is the opposite of what this pool is for.
@@ -281,11 +280,14 @@ private:
 // Access-counter migration of *managed* memory is documented as an implementation
 // detail of current systems rather than a guarantee, which is why this stays behind
 // an env knob.
+//
+// Oversizing happens at the pool group, not here: a slot id spans every pool in a
+// group, so the slot count cannot differ between them. See uvmOversizeRatio().
 // ---------------------------------------------------------------------------
 class UvmSlotPool : public SlotPoolBase
 {
 public:
-    UvmSlotPool(size_t slotSize, SlotCount numSlots, double oversizeRatio);
+    UvmSlotPool(size_t slotSize, SlotCount numSlots);
     ~UvmSlotPool() override;
 
     UvmSlotPool(UvmSlotPool const&) = delete;
@@ -306,7 +308,12 @@ private:
 // True only when TLLM_KVCM2_UVM_SPARSE=1 and the group carries a sparse DeepSeek-V4 role.
 [[nodiscard]] bool useUvmForSlotDesc(SlotDesc const& slotDesc);
 
-// Oversize ratio for UVM pools; TLLM_KVCM2_UVM_OVERSIZE, default 4.0.
+// Slot-count multiplier for a UVM pool group; TLLM_KVCM2_UVM_OVERSIZE, default 4.0.
+//
+// Applies to the whole group, so the VMM-backed pools beside the managed one grow too
+// and consume that much more real HBM. That is the intended trade for DeepSeek-V4: the
+// group's other pool is INDEXER_COMPRESS at ~132 B/token against COMPRESS's ~576, so
+// carrying it along costs roughly a fifth again of the sparse data itself.
 [[nodiscard]] double uvmOversizeRatio();
 
 // ---------------------------------------------------------------------------
