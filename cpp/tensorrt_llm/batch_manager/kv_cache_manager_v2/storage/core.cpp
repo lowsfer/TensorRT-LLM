@@ -18,16 +18,20 @@
 #include "kv_cache_manager_v2/storage/core.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <unistd.h>
 #include <unordered_map>
 
@@ -351,6 +355,139 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 }
 
 // ---------------------------------------------------------------------------
+// UvmSlotPool
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+//! The DeepSeek-V4 role whose history this experiment offloads. Hard-coded on purpose:
+//! this path exists to measure one model, and keying on the role rather than a byte size
+//! keeps it from silently matching an unrelated pool when head_dim or tokens_per_block move.
+constexpr char kUvmSparseRole[] = "deepseek_v4_compress";
+
+bool uvmEnabled()
+{
+    static bool const enabled = []
+    {
+        char const* v = std::getenv("TLLM_KVCM2_UVM_SPARSE");
+        return v != nullptr && std::string_view{v} == "1";
+    }();
+    return enabled;
+}
+
+//! Access-counter migration needs the GPU to walk host page tables, which is the
+//! Grace/C2C signature. Fail loudly rather than silently falling back: on a PCIe part
+//! this pool would still run, at fault-and-migrate speed, and quietly produce numbers
+//! that mean nothing.
+void checkCoherentPlatform()
+{
+    int device = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    int usesHostPageTables = 0;
+    if (cudaDeviceGetAttribute(&usesHostPageTables, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device)
+        != cudaSuccess)
+    {
+        usesHostPageTables = 0;
+        cudaGetLastError();
+    }
+    TLLM_CHECK_WITH_INFO(usesHostPageTables != 0,
+        "TLLM_KVCM2_UVM_SPARSE requires a hardware-coherent CPU-GPU link (Grace C2C); "
+        "this device does not use host page tables");
+}
+
+} // namespace
+
+bool useUvmForSlotDesc(SlotDesc const& slotDesc)
+{
+    if (!uvmEnabled())
+    {
+        return false;
+    }
+    for (auto const& variant : slotDesc.variants)
+    {
+        for (auto const& cb : variant.coalescedBuffers)
+        {
+            for (auto const& bid : cb.bufferIds)
+            {
+                if (bid.role == kUvmSparseRole)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+double uvmOversizeRatio()
+{
+    static double const ratio = []
+    {
+        auto const v = tensorrt_llm::common::getFloatEnv("TLLM_KVCM2_UVM_OVERSIZE");
+        double const r = v.value_or(4.0F);
+        TLLM_CHECK_WITH_INFO(r >= 1.0, "TLLM_KVCM2_UVM_OVERSIZE must be >= 1.0");
+        return r;
+    }();
+    return ratio;
+}
+
+UvmSlotPool::UvmSlotPool(size_t slotSize, SlotCount numSlots, double oversizeRatio)
+    : SlotPoolBase(slotSize)
+{
+    checkCoherentPlatform();
+
+    // Sized once for the whole run: the driver, not this class, decides what is resident,
+    // so there is nothing to grow later. resize() only moves the handed-out slot count.
+    size_t const requested = slotCountToSizeT(numSlots) * slotSize;
+    mCapacityBytes = static_cast<size_t>(static_cast<double>(requested) * oversizeRatio);
+    mCapacityBytes = std::max(mCapacityBytes, requested);
+
+    TLLM_CUDA_CHECK(cudaMallocManaged(&mBase, mCapacityBytes));
+
+    int device = 0;
+    TLLM_CUDA_CHECK(cudaGetDevice(&device));
+    TLLM_CUDA_CHECK(cudaMemAdvise(
+        mBase, mCapacityBytes, cudaMemAdviseSetAccessedBy, cudaMemLocation{cudaMemLocationTypeDevice, device}));
+
+    mNumSlots = numSlots;
+}
+
+UvmSlotPool::~UvmSlotPool()
+{
+    destroy();
+}
+
+SlotCount UvmSlotPool::numSlots() const noexcept
+{
+    return mNumSlots;
+}
+
+void UvmSlotPool::destroy()
+{
+    if (mBase != nullptr)
+    {
+        cudaFree(mBase);
+        mBase = nullptr;
+        mCapacityBytes = 0;
+        mNumSlots = SlotCount{0};
+    }
+}
+
+void UvmSlotPool::resize(SlotCount newNumSlots)
+{
+    TLLM_CHECK_WITH_INFO(slotCountToSizeT(newNumSlots) * mSlotSize <= mCapacityBytes,
+        "UvmSlotPool::resize beyond the oversized allocation; raise TLLM_KVCM2_UVM_OVERSIZE");
+    mNumSlots = newNumSlots;
+}
+
+Address UvmSlotPool::slotAddress(SlotId slot) const
+{
+    TLLM_CHECK_DEBUG_WITH_INFO(isValidSlotId(slot), "UvmSlotPool::slotAddress: slot index out of bounds");
+    return MemAddress(reinterpret_cast<uintptr_t>(mBase) + mSlotSize * toSizeT(slot));
+}
+
+// ---------------------------------------------------------------------------
 // HostSlotPool
 // ---------------------------------------------------------------------------
 
@@ -553,10 +690,19 @@ TypedVec<PoolIndex, size_t> PoolGroupBase::slotSize() const
 // GpuPoolGroup
 // ---------------------------------------------------------------------------
 
-GpuPoolGroup::GpuPoolGroup(
-    SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator)
+GpuPoolGroup::GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+    PooledPhysMemAllocator& physMemAllocator, bool useUvm)
     : PoolGroupBase(numSlots)
 {
+    if (useUvm)
+    {
+        double const oversize = uvmOversizeRatio();
+        for (size_t sz : slotSizeList)
+        {
+            mPools.push_back(std::make_unique<UvmSlotPool>(sz, numSlots, oversize));
+        }
+        return;
+    }
     size_t physMemSize = physMemAllocator.physMemSize();
     // Query total GPU memory to size virtual address space (mirrors Python GpuPoolGroup).
     size_t totalGpuMem = 0;
@@ -647,8 +793,8 @@ GpuCacheLevelStorage::GpuCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> co
         "GpuCacheLevelStorage: slotCountList and slotDescList must have the same length");
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
     {
-        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(
-            slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mPhysMemAllocator));
+        mPoolGroups.push_back(std::make_unique<GpuPoolGroup>(slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(),
+            mPhysMemAllocator, useUvmForSlotDesc(slotDescList[pgIdx])));
     }
 }
 

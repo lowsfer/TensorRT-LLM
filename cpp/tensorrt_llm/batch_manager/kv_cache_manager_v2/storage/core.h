@@ -265,6 +265,51 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// UvmSlotPool — CUDA managed memory pool whose residency the driver manages.
+//
+// EXPERIMENTAL, DeepSeek-V4 only. Opt in with TLLM_KVCM2_UVM_SPARSE=1.
+//
+// Backs a pool with cudaMallocManaged and sets cudaMemAdviseSetAccessedBy for the
+// device, which on a hardware-coherent (C2C) platform switches the driver from
+// fault-and-migrate to access-counter migration: hot pages move to HBM on their own
+// and cold pages are evicted back to host under memory pressure. The allocation is
+// deliberately oversized relative to the slot count so that pressure exists.
+//
+// cudaMemAdviseSetPreferredLocation is deliberately NOT set. Pointing it at the host
+// prevents counter migration, which is the opposite of what this pool is for.
+//
+// Access-counter migration of *managed* memory is documented as an implementation
+// detail of current systems rather than a guarantee, which is why this stays behind
+// an env knob.
+// ---------------------------------------------------------------------------
+class UvmSlotPool : public SlotPoolBase
+{
+public:
+    UvmSlotPool(size_t slotSize, SlotCount numSlots, double oversizeRatio);
+    ~UvmSlotPool() override;
+
+    UvmSlotPool(UvmSlotPool const&) = delete;
+    UvmSlotPool& operator=(UvmSlotPool const&) = delete;
+
+    SlotCount numSlots() const noexcept override;
+    void destroy() override;
+    void resize(SlotCount newNumSlots) override;
+    Address slotAddress(SlotId slot) const override;
+
+private:
+    void* mBase{nullptr};
+    size_t mCapacityBytes{0}; // allocated, including oversize headroom
+    SlotCount mNumSlots{0};   // slots currently handed out
+};
+
+// Whether the UVM path is enabled and this pool group should use it.
+// True only when TLLM_KVCM2_UVM_SPARSE=1 and the group carries a sparse DeepSeek-V4 role.
+[[nodiscard]] bool useUvmForSlotDesc(SlotDesc const& slotDesc);
+
+// Oversize ratio for UVM pools; TLLM_KVCM2_UVM_OVERSIZE, default 4.0.
+[[nodiscard]] double uvmOversizeRatio();
+
+// ---------------------------------------------------------------------------
 // HostSlotPool — pinned host memory pool.
 // ---------------------------------------------------------------------------
 class HostSlotPool : public SlotPoolBase
@@ -394,8 +439,10 @@ protected:
 class GpuPoolGroup : public PoolGroupBase
 {
 public:
-    GpuPoolGroup(
-        SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, PooledPhysMemAllocator& physMemAllocator);
+    //! useUvm swaps GpuSlotPool for UvmSlotPool across the whole group. Per-group rather
+    //! than per-pool so every pool a lifecycle addresses keeps one allocation scheme.
+    GpuPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList,
+        PooledPhysMemAllocator& physMemAllocator, bool useUvm = false);
 };
 
 class HostPoolGroup : public PoolGroupBase
