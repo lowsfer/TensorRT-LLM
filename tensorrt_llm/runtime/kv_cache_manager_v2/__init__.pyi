@@ -273,39 +273,42 @@ class BufferConfig:
     non-sparse buffer raises from the ``KVCacheManager`` constructor.
 
     All GPU residency is a per-request cache drawn from the sparse pool's GPU tier: both
-    the blocks still being written and the history a step selects are cells in it.
-    ``max_cached_units`` is the whole cache, counting both populations, and the reservation
-    follows from it alone. The two never overlap -- the selection is below the watermark,
-    everything in flight is above it -- so whatever the cache holds beyond a full selection
-    is the in-flight headroom, which is what :attr:`_KVCache.max_input_length` reports.
-    Prefill and decode share one manager, so that second population is a whole chunk during
-    prefill rather than a single block.
+    the unit being written and the history a step selects are cells in it.
+    ``max_cached_units`` counts both populations and determines the reservation at
+    :meth:`_KVCache.resume`. The fetch path supports one query token per request per step,
+    so at most one unit is in flight. Once this path is configured,
+    :attr:`_KVCache.max_input_length` is one token regardless of cache size. Prefill is
+    served by a separate instance; speculative decoding is unsupported.
+
+    A selection unit spans ``tokens_per_block_override`` original tokens, or the manager's
+    ``tokens_per_block`` when no override is set. ``size`` is the number of bytes per unit,
+    and ``num_selected_blocks`` is the selection width in units. Allocation and locking
+    still operate on pages of the manager's ``tokens_per_block`` tokens.
 
     A reserved slot is a row of buffer-sized cells and any layer's unit may occupy any cell,
     so an entry is a ``(layer, entry index)`` pair resolved to a cell arithmetically.
     Coalescing earns nothing here, because layers select different units and so share
     nothing. :meth:`KVCacheManager.fetch_sparse_pages` fills the cells a step selects.
 
-    Two to four times ``num_selected_blocks`` is the usual starting point -- a cache only as
-    wide as the selection retains nothing between steps, and retention of units not selected
-    this step is where the hit rate comes from -- but the surplus is also what bounds a
-    request's input length, so size for whichever demand is larger. ``max_cached_units``
-    must exceed ``num_selected_blocks``, since equality would leave no cell for the block
-    being written. Both default to zero, meaning the fetch path is not configured for this
-    buffer; sparse storage and locking work without them.
+    Two to four times ``num_selected_blocks`` is the usual starting point: extra cells
+    retain history units across steps and improve the cache hit rate. ``max_cached_units``
+    must exceed ``num_selected_blocks`` to leave room for the unit being written. Increasing
+    it preserves more history without changing the one-token input bound. Both fields
+    default to zero, meaning the fetch path is not configured for this buffer; sparse
+    storage and locking work without them.
 
     ``sparse_unit_layout`` tells the manager where a selection unit's bytes are. It is
-    required once ``max_cached_units`` is set, because a cell that cannot be located can be
-    neither filled nor written back. A buffer whose cold form is compressed, or whose units
-    are not locatable by arithmetic, supplies extraction code instead.
+    required once ``max_cached_units`` is set. Fetch and write-back require the default
+    cold-page codec and an arithmetic layout. Custom extraction code and compressed cold
+    representations are unsupported.
 
-    A block's data reaches its host page by a write-back that leaves the cell cached and
-    merely stops pinning it. A block must be written back before it can be selected, so
+    A unit's data reaches its host page by a write-back that leaves the cell cached and
+    merely stops pinning it. A unit must be written back before it can be selected, so
     :meth:`_KVCache.resize` is both the deadline and the only place it happens -- that being
     the one call through which the watermark ever moves. ``commit()`` is not a separate
     write-back site: a committed block is already at or below the watermark, and where
     ``commit()`` advances the watermark it calls :meth:`_KVCache.resize`. A cell is
-    evictable exactly when its unit is below the watermark, which is what protects the block
+    evictable exactly when its unit is below the watermark, which is what protects the unit
     still being written.
 
     Fixed at construction: the storage layout derived from it is built once.
@@ -752,10 +755,10 @@ def create_default_kv_cache_cold_page_codec() -> IKvCacheColdPageCodec:
 class Batch:
     """The ``_KVCache`` objects stepped together, and their device-side mirror.
 
-    Owns the batch row order and every per-row device array the sparse path reads: a page
-    table per layer group, the eligible-block counts, and the staging buffers behind
-    them. Every such array is indexed by row, and each must agree on which row a request
-    occupies, so the order lives here rather than being re-established per call.
+    Owns the batch row order, a device page table per layer group, per-row history lengths
+    and capacities, and the staging buffers behind them. Device cache views hold pointers
+    to each request's sparse cache state. Every per-row array uses the same request order,
+    so that order lives here rather than being re-established per call.
 
     Rows are slots rather than positions in a compacted list: removing a member leaves a
     hole for reuse instead of shifting later rows, keeping array shapes and addresses
@@ -763,10 +766,12 @@ class Batch:
 
     Membership is exclusive -- a ``_KVCache`` belongs to at most one ``Batch``.
 
-    A member marks its row dirty whenever its locks change: a committed block, a beam
-    fork, an SWA recycle, a ``history_length`` advance. Publication then refreshes only
-    dirty rows, so mutating a member directly costs a republish rather than producing a
-    stale table.
+    Members write their page indices directly into their assigned staging rows.
+    :meth:`publish` collects their current history lengths, capacities and cache views,
+    then uploads the entire metadata allocation. Membership changes and direct member
+    mutations become visible on the device at the next publication. Call
+    :meth:`wait_published` before a direct mutation that writes a staging row;
+    :meth:`resize` handles this wait and the subsequent publication for a batched step.
     """
 
     def __init__(
@@ -814,13 +819,13 @@ class Batch:
         """
 
     def publish(self, stream: CudaStream) -> None:
-        """Copy the staged page indices and watermarks to the device, enqueuing on ``stream``.
+        """Upload page indices, watermarks and cache views together on ``stream``.
 
-        Page indices are published as stored -- level-relative, unscaled, and with
-        ``BAD_PAGE_INDEX`` preserved rather than folded to a safe slot. A sparse table
-        numbers pure-history and input-token entries in different levels' pools, so only
-        the sentinel separates an absent block from slot zero; the dense path's scaled
-        block offsets cannot serve here for that reason.
+        The entire metadata allocation is copied in one asynchronous transfer. Page
+        indices are published as stored: level-relative, unscaled, and with
+        ``BAD_PAGE_INDEX`` preserved. Every page of a sparse group is indexed in
+        ``CACHE_LEVEL1``; ordinary groups use ``GPU_LEVEL``. Sparse GPU cache entries are
+        addressed separately by :meth:`KVCacheManager.fetch_sparse_pages`.
         """
 
     def wait_published(self) -> None:
@@ -890,6 +895,66 @@ class KVCacheManager:
 
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def prepare_sparse_write_indices(
+        self,
+        batch: Batch,
+        buffers: Sequence[BufferId],
+        out: DeviceArray,  # int32[batch, len(buffers), 1]
+        stream: CudaStream,
+    ) -> None:
+        """Prepare physical GPU indices for a layer's in-flight KV writes.
+
+        This interface is declared only; runtime support is not implemented.
+
+        For each request, the in-flight unit ordinals are in
+        ``[history_length // unit_tokens, capacity // unit_tokens)``, where
+        ``unit_tokens`` is the buffer's ``tokens_per_block_override`` or the manager's
+        ``tokens_per_block``. This path supports one query token per request per step,
+        so the range contains at most one unit. Prefill and speculative decoding are
+        unsupported.
+
+        Resolve that unit on the GPU against the request's resident set for this layer.
+        Reuse its entry if present; otherwise assign a free entry or evict eligible
+        least-recently-used history, and update the residency metadata. The entry stays
+        pinned while the unit is in flight, including during :meth:`fetch_sparse_pages`.
+        Repeated preparation with unchanged watermarks and reservation reuses the entry.
+        No KV bytes are fetched from host or initialized: the model must write them.
+
+        Args:
+            batch: Batch whose current watermarks and cache views have been published.
+                Live requests must hold the GPU cache reservation from :meth:`_KVCache.resume`.
+            buffers: Exactly one layer's sparse buffers, in the same order required by
+                :meth:`fetch_sparse_pages`, with the sparse cache configured.
+            out: Caller-allocated, contiguous CUDA ``int32`` array of shape
+                ``[batch.max_batch_size, len(buffers), 1]`` in the batch's row order.
+                Every element is overwritten. ``out[b, i, 0]`` is the physical GPU index
+                of the in-flight unit for ``buffers[i]``. It is ``BAD_PAGE_INDEX`` when
+                the row has no reservation or no in-flight unit.
+            stream: CUDA stream on which preparation is enqueued; the call returns
+                without waiting for device completion.
+
+        Output indices use the same expanded GPU index space as :meth:`fetch_sparse_pages`.
+        Pair them with the common GPU pool base from :meth:`get_mem_pool_base_address`
+        using ``PageIndexMode.PER_LAYER`` and the buffer's layout. The output exposes
+        physical indices for each buffer, rather than internal cache-entry numbers.
+
+        Call after batch publication and prior consumers of the same cache, and before
+        the model's KV writes. Order these operations through a shared stream or events.
+        Preparation requires no selection, so it can run before the indexer produces top-k.
+        Attention may use these indices alongside fetched history after both the KV writes
+        and history fetch finish. Complete the writes before advancing history through
+        :meth:`_KVCache.resize`, which writes completed units back to host. Regenerate the
+        output after watermarks or reservations change, and keep it alive and unmodified
+        until its consumers finish. Preallocated output and device-side resolution allow
+        preparation to be captured in a CUDA graph.
+
+        For example, with four original tokens per unit, history 127 and capacity 128
+        require unit 31. Preparation assigns or reuses its GPU entry and exposes its
+        physical index for the compressor to write. With history 128 and capacity 129,
+        no unit is in flight and the output is ``BAD_PAGE_INDEX``.
+        """
+        ...
+
     def fetch_sparse_pages(
         self,
         batch: Batch,
@@ -917,30 +982,28 @@ class KVCacheManager:
         behalf of every buffer at once: filling only some would leave the rest stale while
         the metadata claimed otherwise.
 
-        ``selected`` holds block ordinals, ``topk`` uniform across requests and ``-1``
-        past a request's valid count. The page table and the per-request count of
-        eligible blocks come from ``batch``, whose row order ``selected`` and ``out``
-        both inherit.
+        ``selected`` holds selection-unit ordinals, ``topk`` uniform across requests and
+        ``-1`` past a request's valid count. The page table and token watermarks come from
+        ``batch``, whose row order ``selected`` and ``out`` both inherit. The eligible-unit
+        count is ``history_length // unit_tokens``, where ``unit_tokens`` is the buffer's
+        ``tokens_per_block_override`` or the manager's ``tokens_per_block``.
 
-        Eligible means below the history watermark: a block at or above it holds input
-        tokens whose host page has not been written back yet, so selecting it would read
-        stale bytes. Not a memory-safety problem -- the page table is uniform, so the
-        ordinal resolves to a real page of the same request -- but a wrong answer. The call
-        cannot detect an ineligible ordinal, so naming only eligible ones is the selector's
+        Only units below that count are eligible. A unit still being written has no valid
+        host copy until write-back, so the selector must exclude it. The call does not
+        validate selection eligibility; naming only eligible ordinals is the caller's
         responsibility.
 
         Each selected unit is looked up in the owning request's cache for that layer.
         A hit is reused in place; a miss is copied from the locked host page into a slot
         taken from the free list, evicting least-recently-used when it is empty.
         Reservation at :meth:`_KVCache.resume` guarantees room for a full selection
-        width, so a fetch always satisfies its own layer, and within a step a fetch may
-        evict entries of layers already processed but never one a later kernel still
-        needs.
+        width. Eviction operates within that request's resident set for the layer being
+        fetched and preserves the selected units and the unit still being written.
 
         Copies leave the host page authoritative rather than moving it, so evicting a
         fetched cell moves no data. The copies are a snapshot, which is sound only because a
-        block below the watermark is already written back and immutable. A cell holding an
-        in-flight block is the one exception, and is never an eviction candidate.
+        unit below the watermark is already written back and immutable. A cell holding an
+        in-flight unit is the one exception, and is never an eviction candidate.
 
         ``out`` is written in full and is **compact**: entry ``[b][i][k]`` is the
         ``GPU_LEVEL`` index holding ``selected[b][k]`` for ``buffers[i]``, and
@@ -982,8 +1045,9 @@ class KVCacheManager:
         token would invalidate an index already returned for an earlier one. Widening this
         to one row per token would make that reachable rather than fix it.
 
-        Serving prefill from a host-resident history is an open design question; see
-        SPARSE_ATTENTION_DESIGN.md.
+        This path serves the decode instance of a disaggregated deployment. Prefill runs
+        on a separate instance, and its history must reach the host pages before fetching.
+        Serving prefill from host-resident history is unsupported; see SPARSE_ATTENTION_DESIGN.md.
         """
 
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
