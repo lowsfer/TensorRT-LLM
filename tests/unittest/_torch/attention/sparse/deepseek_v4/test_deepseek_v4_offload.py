@@ -47,7 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRA
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
 
-from .test_deepseek_v4_cache_manager import _history_case, _manager
+from .test_deepseek_v4_cache_manager import _history_case, _manager, _SparseBatch
 
 _requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -71,7 +71,11 @@ def _metadata(manager, *, enabled=True, graph=False, buffers=None, initialize=Tr
     metadata.is_cuda_graph = graph
     metadata.cuda_graph_buffers = buffers
     if initialize:
-        metadata._init_sparse_offload_state()
+        with patch(
+            "tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata.Batch",
+            side_effect=lambda *args, **kwargs: _SparseBatch(*args, **kwargs, device="cuda"),
+        ):
+            metadata._init_sparse_offload_state()
     return metadata
 
 
@@ -131,13 +135,15 @@ def test_sparse_offload_buffers_are_persistent_and_separate(graph):
     buffers = Buffers() if graph else None
     metadata = _metadata(manager, graph=graph, buffers=buffers)
     state = metadata.sparse_offload_state
-    assert state.history_blocks_host.is_pinned()
+    assert state.batch.max_batch_size == 4
+    assert state.batch.max_blocks_per_seq == 6
     assert state.selected_history_pages.shape == (4, 6)
     tables = [*state.base_page_tables.values(), state.fetched_page_table, state.compress_read_table]
     assert all(table.shape == (4, 6) for table in tables)
     device_tensors = tables + [
         state.selected_history_pages,
         state.history_blocks,
+        state.history_lengths,
         state.active_request_count,
     ]
     assert all(tensor.is_cuda and tensor.dtype == torch.int32 for tensor in device_tensors)
@@ -147,9 +153,9 @@ def test_sparse_offload_buffers_are_persistent_and_separate(graph):
     if graph:
         # Same-name graph buffers can be reused for serial graph buckets.
         reused = _metadata(manager, graph=True, buffers=buffers).sparse_offload_state
-        assert reused.base_page_tables[13].data_ptr() == state.base_page_tables[13].data_ptr()
+        assert reused.batch is not state.batch
+        assert reused.base_page_tables[13].data_ptr() != state.base_page_tables[13].data_ptr()
         assert reused.compress_read_table.data_ptr() == state.compress_read_table.data_ptr()
-        assert reused.history_blocks_host.data_ptr() != state.history_blocks_host.data_ptr()
 
 
 @_requires_cuda
@@ -199,16 +205,18 @@ def test_prepare_sparse_offload_request_order_and_boundaries(tokens_per_block):
                 state.compress_read_table,
             )
         )
-        if live_ids:
-            assert manager.impl.calls[-1][:2] == (live_ids, 13)
-            assert manager.impl.calls[-1][3] == prepare_stream.cuda_stream
+        assert state.batch.publications[-1] == (live_ids, prepare_stream.cuda_stream)
+        assert [state.batch.row_of(manager.kv_cache_map[req]) for req in live_ids] == list(
+            range(len(live_ids))
+        )
         assert pointers == [
             t.data_ptr() for t in (state.history_blocks, state.base_page_tables[13], write)
         ]
         # Change the frontier and physical assignment without replacing tensors.
         manager.kv_cache_map[10].history_length = 2 * tokens_per_block
         manager.kv_cache_map[10].pages = [17, 19, 0]
-    assert len(manager.impl.calls) == 3  # The empty batch does not call KVCM.
+    assert len(state.batch.publications) == 4  # Empty batches clear all device rows.
+    assert not manager.impl.calls  # No separate page-table upload.
 
 
 @_requires_cuda
@@ -241,6 +249,7 @@ def test_sparse_offload_rejects_invalid_preparation(invalid):
         with pytest.raises((ValueError, KeyError, RuntimeError)):
             manager.prepare_sparse_offload(state, ids, write, beam_width=beam)
     assert not manager.impl.calls
+    assert not state.batch.publications
     assert state.active_request_count.item() == 0
 
 
@@ -271,7 +280,7 @@ def test_metadata_routes_only_sparse_main_table(enabled):
     ]
     assert ratios == ([128] if enabled else [4, 128])
     if enabled:
-        assert manager.impl.calls[-1][0] == [20, 10]
+        assert metadata.sparse_offload_state.batch.publications[-1][0] == [20, 10]
         assert metadata.compress_block_tables[4][0, 0].item() == -1
         assert metadata.compress_block_tables[4][0, 1].item() == 0
     else:

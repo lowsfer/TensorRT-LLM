@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from math import prod
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import Mock, patch
@@ -42,6 +44,7 @@ from tensorrt_llm._torch.kv_cache_compression.quantization_for_cold_page.nvfp4_q
 )
 from tensorrt_llm._torch.pyexecutor._util import CacheCost
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    CUDA_GRAPH_DUMMY_REQUEST_ID,
     BlockReusePolicy,
     KVCacheManagerV2,
 )
@@ -61,7 +64,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
     BatchDesc,
-    BufferConfig,
     GpuCacheTierConfig,
     HostCacheTierConfig,
     KVCacheDesc,
@@ -127,6 +129,8 @@ class _SparseRuntime:
 def _manager(tokens_per_block=128):
     manager = object.__new__(DeepseekV4CacheManager)
     manager._enable_kv_cache_offload = True
+    manager._sparse_batch_state = None
+    manager._set_page_index_bufs = Mock()
     manager.max_beam_width = 1
     manager.max_draft_len = 0
     manager.max_total_draft_tokens = 0
@@ -156,10 +160,273 @@ def _manager(tokens_per_block=128):
         30: SimpleNamespace(id=30, history_length=tokens_per_block + 1, pages=[8, 7, 0]),
     }
     for cache in manager.kv_cache_map.values():
+        cache.is_active = True
         cache.num_blocks = len(cache.pages)
         cache.capacity = cache.num_blocks * tokens_per_block
         cache.beam_width = 1
     return manager
+
+
+class _SparseBatch:
+    """Fixed rows and published tensors, without a native CUDA allocation."""
+
+    def __init__(self, manager, *, max_batch_size, max_blocks_per_seq, device="cpu"):
+        self.max_batch_size = max_batch_size
+        self.max_blocks_per_seq = max_blocks_per_seq
+        self.rows = [None] * max_batch_size
+        self.publications = []
+        self.events = []
+        self.pending = False
+        self.tables = {
+            group: torch.full(
+                (max_batch_size, max_blocks_per_seq), -1, dtype=torch.int32, device=device
+            )
+            for group in set(manager.groups.values())
+        }
+        self.histories = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
+        self.capacity_values = torch.zeros_like(self.histories)
+
+    def add_kv_cache(self, cache):
+        assert self.row_of(cache) == -1
+        row = self.rows.index(None)
+        self.rows[row] = cache
+        self.events.append(("add", cache.id, row))
+        return row
+
+    def row_of(self, cache):
+        return next((row for row, member in enumerate(self.rows) if member is cache), -1)
+
+    def remove_kv_cache(self, cache):
+        assert not self.pending, "Pinned staging must be retired before detaching"
+        row = self.row_of(cache)
+        assert row >= 0
+        self.rows[row] = None
+        self.events.append(("remove", cache.id, row))
+
+    def wait_published(self):
+        self.events.append(("wait",))
+        self.pending = False
+
+    def publish(self, stream):
+        table = torch.full((self.max_batch_size, self.max_blocks_per_seq), -1, dtype=torch.int32)
+        histories = torch.zeros(self.max_batch_size, dtype=torch.int32)
+        capacities = torch.zeros_like(histories)
+        for row, cache in enumerate(self.rows):
+            if cache is not None:
+                table[row, : cache.num_blocks] = torch.tensor(cache.pages, dtype=torch.int32)
+                histories[row] = cache.history_length
+                capacities[row] = cache.capacity
+        for target in self.tables.values():
+            target.copy_(table)
+        self.histories.copy_(histories)
+        self.capacity_values.copy_(capacities)
+        self.publications.append(([cache.id for cache in self.rows if cache is not None], stream))
+        self.pending = True
+
+    def page_table(self, group):
+        return self.tables[group]
+
+    def history_lengths(self):
+        return self.histories
+
+
+def _sparse_batch_state(manager, max_batch_size=4):
+    batch = _SparseBatch(manager.impl, max_batch_size=max_batch_size, max_blocks_per_seq=6)
+    return SimpleNamespace(
+        batch=batch,
+        kv_caches={},
+        prepared=False,
+        layers={2: SimpleNamespace(group_id=13, page_scale=5)},
+        base_page_tables={13: batch.page_table(13)},
+        history_lengths=batch.history_lengths(),
+        history_blocks=torch.zeros(max_batch_size, dtype=torch.int32),
+        active_request_count=torch.zeros(1, dtype=torch.int32),
+        selected_history_pages=torch.full((max_batch_size, 6), -1, dtype=torch.int32),
+        fetched_page_table=torch.full((max_batch_size, 6), -1, dtype=torch.int32),
+        compress_read_table=torch.full((max_batch_size, 6), -1, dtype=torch.int32),
+    )
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_publishes_attention_order_and_clears_padding() -> None:
+    manager = _manager()
+    manager._stream = Mock(cuda_stream=19)
+    state = _sparse_batch_state(manager)
+    write = torch.empty((4, 6), dtype=torch.int32)
+    pointers = state.history_lengths.data_ptr(), state.base_page_tables[13].data_ptr()
+    with (
+        patch("torch.cuda.device", side_effect=lambda device: nullcontext()),
+        patch("torch.cuda.current_stream", return_value=manager._stream),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+        patch.object(deepseek_v4_cache, "prepare_sparse_write_table"),
+    ):
+        for ids in (
+            [30, 10, 20],
+            [20, CUDA_GRAPH_DUMMY_REQUEST_ID, CUDA_GRAPH_DUMMY_REQUEST_ID],
+            [],
+            [10],
+        ):
+            manager.prepare_sparse_offload(state, ids, write, beam_width=1)
+            live = [req for req in ids if req != CUDA_GRAPH_DUMMY_REQUEST_ID]
+            assert list(state.kv_caches) == live
+            assert state.batch.publications[-1] == (live, 19)
+            for row, request_id in enumerate(live):
+                cache = manager.kv_cache_map[request_id]
+                assert state.batch.row_of(cache) == row
+                assert state.history_lengths[row].item() == cache.history_length
+                assert state.batch.capacity_values[row].item() == cache.capacity
+                assert state.base_page_tables[13][row, : cache.num_blocks].tolist() == cache.pages
+            assert (state.history_lengths[len(live) :] == 0).all()
+            assert (state.batch.capacity_values[len(live) :] == 0).all()
+            assert (state.base_page_tables[13][len(live) :] == -1).all()
+            assert state.active_request_count.item() == len(live)
+            assert pointers == (
+                state.history_lengths.data_ptr(),
+                state.base_page_tables[13].data_ptr(),
+            )
+            assert state.prepared
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_switch_restores_host_tables_and_detaches_previous_metadata() -> None:
+    manager = _manager()
+    first = _sparse_batch_state(manager)
+    second = _sparse_batch_state(manager, max_batch_size=2)
+    manager._publish_sparse_batch(first, [20, 10], 19)
+    first.prepared = True
+    manager._publish_sparse_batch(second, [10, 20], 23)
+    assert not first.prepared
+    assert not first.kv_caches
+    assert first.batch.rows == [None] * 4
+    assert first.batch.events[-3:] == [("wait",), ("remove", 20, 0), ("remove", 10, 1)]
+    assert [call.args[0] for call in manager._set_page_index_bufs.call_args_list] == [20, 10]
+    assert second.batch.row_of(manager.kv_cache_map[10]) == 0
+    assert second.history_lengths[1] == manager.kv_cache_map[20].history_length
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("failure", ["add", "publish"])
+def test_sparse_batch_failed_publication_restores_attached_requests(failure: str) -> None:
+    manager = _manager()
+    state = _sparse_batch_state(manager, max_batch_size=1 if failure == "add" else 4)
+    if failure == "publish":
+        state.batch.publish = Mock(side_effect=RuntimeError("publish failed"))
+    with pytest.raises((ValueError, RuntimeError)):
+        manager._publish_sparse_batch(state, [20, 10], 19)
+    assert manager._sparse_batch_state is None
+    assert not state.kv_caches
+    assert all(row is None for row in state.batch.rows)
+    assert not state.prepared
+    assert manager._set_page_index_bufs.call_count == (1 if failure == "add" else 2)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "try_allocate_generation",
+        "revert_allocate_generation",
+        "suspend_request",
+        "resume_request",
+        "release_index_slot",
+        "free_resources",
+        "shutdown",
+        "prepare_resources",
+        "prepare_context_cache",
+        "resize_context",
+        "revert_allocate_context",
+        "prepare_disagg_gen_init",
+    ],
+)
+def test_sparse_batch_detaches_before_scheduler_mutations(operation: str) -> None:
+    manager = _manager()
+    state = _sparse_batch_state(manager)
+    manager._publish_sparse_batch(state, [20, 10], 19)
+
+    def mutate(*args, **kwargs):
+        assert manager._sparse_batch_state is None
+        assert state.batch.rows == [None] * 4
+        assert manager._set_page_index_bufs.call_count == 2
+        return True
+
+    request = SimpleNamespace(py_request_id=20)
+    args = {
+        "shutdown": (),
+        "release_index_slot": (20,),
+        "prepare_resources": (SimpleNamespace(context_requests=[]),),
+        "resize_context": (request, 1),
+    }.get(operation, (request,))
+    with patch.object(KVCacheManagerV2, operation, side_effect=mutate) as base:
+        getattr(manager, operation)(*args)
+    base.assert_called_once()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "batch",
+        "duplicates",
+        "dummy_order",
+        "unknown",
+        "inactive",
+        "width",
+        "frontier",
+        "beam",
+        "capture",
+    ],
+)
+def test_sparse_batch_rejects_invalid_rows_before_publication(invalid: str) -> None:
+    manager = _manager()
+    manager._stream = Mock(cuda_stream=19)
+    state = _sparse_batch_state(manager)
+    ids, beam = [10], 1
+    if invalid == "batch":
+        ids = [10] * 5
+    elif invalid == "duplicates":
+        ids = [10, 10]
+    elif invalid == "dummy_order":
+        ids = [CUDA_GRAPH_DUMMY_REQUEST_ID, 10]
+    elif invalid == "unknown":
+        ids = [12345]
+    elif invalid == "inactive":
+        manager.kv_cache_map[10].is_active = False
+    elif invalid == "width":
+        manager.kv_cache_map[10].num_blocks = 7
+    elif invalid == "frontier":
+        manager.kv_cache_map[10].history_length = 99999
+    elif invalid == "beam":
+        beam = 2
+    with (
+        patch("torch.cuda.device", side_effect=lambda device: nullcontext()),
+        patch("torch.cuda.is_current_stream_capturing", return_value=invalid == "capture"),
+        pytest.raises((ValueError, KeyError, RuntimeError)),
+    ):
+        manager.prepare_sparse_offload(
+            state, ids, torch.empty((4, 6), dtype=torch.int32), beam_width=beam
+        )
+    assert not state.batch.publications
+    assert not state.kv_caches
+    assert not state.prepared
+
+
+@pytest.mark.cpu_only
+def test_sparse_batch_reuses_row_for_a_new_cache_with_the_same_request_id() -> None:
+    manager = _manager()
+    state = _sparse_batch_state(manager)
+    manager._publish_sparse_batch(state, [10], 19)
+    old_cache = manager.kv_cache_map[10]
+    with patch.object(KVCacheManagerV2, "free_resources"):
+        manager.free_resources(SimpleNamespace(py_request_id=10))
+    new_cache = SimpleNamespace(
+        id=10, history_length=256, capacity=257, num_blocks=3, pages=[7, 8, 9]
+    )
+    manager.kv_cache_map[10] = new_cache
+    manager._publish_sparse_batch(state, [10], 19)
+    assert state.batch.row_of(old_cache) == -1
+    assert state.batch.row_of(new_cache) == 0
+    assert state.history_lengths.tolist() == [256, 0, 0, 0]
+    assert state.base_page_tables[13][0].tolist() == [7, 8, 9, -1, -1, -1]
 
 
 @pytest.mark.cpu_only
@@ -278,6 +545,36 @@ def test_completed_history_advances_without_reuse_or_capacity_growth(tokens_per_
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("context", [False, True])
+def test_sparse_batch_detaches_before_history_update(context: bool) -> None:
+    manager, cache, request, scheduled = _history_case()
+    state = _sparse_batch_state(manager)
+    manager._publish_sparse_batch(state, [20], 19)
+    resize = cache.resize
+
+    def update_history(capacity, history_length):
+        assert not state.batch.pending
+        assert not state.kv_caches
+        assert state.batch.row_of(cache) == -1
+        manager._set_page_index_bufs.assert_called_once_with(20, cache)
+        return resize(capacity, history_length)
+
+    cache.resize = update_history
+    if not context:
+        scheduled.context_requests, scheduled.generation_requests = [], [request]
+    with (
+        patch("torch.cuda.current_stream"),
+        patch("torch.cuda.is_current_stream_capturing", return_value=False),
+    ):
+        if context:
+            manager.update_context_resources(scheduled)
+        else:
+            manager.update_resources(scheduled)
+    assert cache.history_length == 127
+    assert manager._sparse_batch_state is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("context", [False, True])
 @pytest.mark.parametrize(
     "problem", ["resize_failure", "wrong_stream", "capture", "suspended", "removed"]
 )
@@ -350,12 +647,14 @@ def test_chunked_prefill_checked_from_scheduled_request(first, last, enabled):
 @pytest.mark.parametrize("tokens_per_block", [128, 256])
 @pytest.mark.parametrize("pp_layers", [[0, 1, 2, 3], [2, 3]])
 @pytest.mark.parametrize(("dtype", "bytes_per_element"), [(DataType.BF16, 2), (DataType.FP8, 1)])
-def test_sparse_offload_cache_roles(
+@pytest.mark.parametrize("index_topk", [1, 512])
+def test_sparse_offload_cache_config(
     enabled: bool,
     tokens_per_block: int,
     pp_layers: list[int],
     dtype: DataType,
     bytes_per_element: int,
+    index_topk: int,
 ) -> None:
     manager = object.__new__(DeepseekV4CacheManager)
     manager._enable_kv_cache_offload = enabled
@@ -365,6 +664,7 @@ def test_sparse_offload_cache_roles(
     manager.tokens_per_block = tokens_per_block
     manager.head_dim = 512
     manager.index_head_dim = 128
+    manager._index_topk = index_topk
     manager.dtype = dtype
     manager._indexer_k_dtype = "fp8"
     manager._use_nvfp4_compress = False
@@ -386,22 +686,10 @@ def test_sparse_offload_cache_roles(
         layers=[],
     )
 
-    def make_buffer_config(*, role: str, size: int, is_sparse: bool = False) -> BufferConfig:
-        """Keep native buffers while the mock records the unsupported sparse flag."""
-        return BufferConfig(role=role, size=size)
-
-    with patch.object(
-        deepseek_v4_cache, "BufferConfig", side_effect=make_buffer_config
-    ) as create_buffer:
-        result = manager._build_cache_config(config)
+    result = manager._build_cache_config(config)
 
     assert result.tokens_per_block == tokens_per_block
     assert len(result.layers) == manager._num_manager_layers
-    sparse_flags = {}
-    buffers = [(layer.layer_id, buffer) for layer in result.layers for buffer in layer.buffers]
-    for (layer_id, buffer), call in zip(buffers, create_buffer.call_args_list, strict=True):
-        assert (buffer.role, buffer.size) == (call.kwargs["role"], call.kwargs["size"])
-        sparse_flags[layer_id, buffer.role] = call.kwargs.get("is_sparse", False)
     layers = {layer.layer_id: layer for layer in result.layers}
     for (model_layer, attn_type), layer_id in manager._layer_attn_to_layer_id.items():
         assert model_layer in pp_layers
@@ -410,18 +698,116 @@ def test_sparse_offload_cache_roles(
             attn_type,
         )
         buffer = next(b for b in layers[layer_id].buffers if b.role == attn_type.role)
-        assert buffer.tokens_per_block_override is None
         ratio = manager._compress_ratios[model_layer]
-        assert sparse_flags[layer_id, buffer.role] == (
+        assert buffer.is_sparse == (
             enabled and ratio == 4 and attn_type == DeepseekV4AttentionType.COMPRESS
         )
+        if buffer.is_sparse:
+            row_bytes = manager.head_dim * bytes_per_element
+            assert buffer.tokens_per_block_override == 4
+            assert buffer.size == row_bytes
+            assert buffer.num_selected_blocks == index_topk
+            assert buffer.max_cached_units == 2 * index_topk
+            layout = buffer.sparse_unit_layout
+            assert layout is not None
+            assert (
+                layout.num_chunks,
+                layout.chunk_bytes,
+                layout.chunk_stride,
+                layout.unit_stride,
+            ) == (1, row_bytes, 0, row_bytes)
+            assert len(layers[layer_id].buffers) == 1
+            assert layers[layer_id].sliding_window_size is None
+        else:
+            assert buffer.tokens_per_block_override is None
+            assert buffer.num_selected_blocks == buffer.max_cached_units == 0
+            assert buffer.sparse_unit_layout is None
         if attn_type == DeepseekV4AttentionType.COMPRESS:
-            assert buffer.size == tokens_per_block // ratio * manager.head_dim * bytes_per_element
+            expansion = tokens_per_block // (buffer.tokens_per_block_override or tokens_per_block)
+            # Expanding selection units must preserve the bytes in an allocation page.
+            assert buffer.size * expansion == (
+                tokens_per_block // ratio * manager.head_dim * bytes_per_element
+            )
             if ratio == 4:
                 indexer_layer_id = manager._layer_attn_to_layer_id[
                     model_layer, DeepseekV4AttentionType.INDEXER_COMPRESS
                 ]
                 assert (layer_id != indexer_layer_id) is enabled
+
+    converters = {
+        (layer.layer_id, buffer.role): SimpleNamespace(
+            scale=1,
+            expansion=tokens_per_block // (buffer.tokens_per_block_override or tokens_per_block),
+        )
+        for layer in result.layers
+        for buffer in layer.buffers
+    }
+    manager.layer_to_pool_mapping_dict = dict.fromkeys(layers, 0)
+    manager.impl = Mock()
+    manager.impl.get_page_index_converter.side_effect = lambda layer, role: converters[layer, role]
+    manager._assert_layer_pool_scale()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("tokens_per_block", [128, 256])
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+@pytest.mark.parametrize(("dtype", "bytes_per_element"), [(DataType.BF16, 2), (DataType.FP8, 1)])
+def test_sparse_compress_buffer_view(
+    enabled: bool,
+    tokens_per_block: int,
+    compress_ratio: int,
+    dtype: DataType,
+    bytes_per_element: int,
+) -> None:
+    manager = object.__new__(DeepseekV4CacheManager)
+    manager._enable_kv_cache_offload = enabled
+    manager._compress_ratios = [compress_ratio]
+    manager.compressed_block_sizes = [tokens_per_block // compress_ratio]
+    manager.tokens_per_block = tokens_per_block
+    manager.head_dim = 512
+    manager.index_head_dim = 128
+    manager.dtype = dtype
+    manager._use_nvfp4_compress = False
+    manager.use_fp8_ds_mla = False
+    manager._layer_attn_to_layer_id = {(0, DeepseekV4AttentionType.COMPRESS): 7}
+
+    sparse = enabled and compress_ratio == 4
+    expansion = tokens_per_block // 4 if sparse else 1
+    layer_offset = 17
+    pool_pages = 320
+    pool_base = 100000
+    page_bytes = tokens_per_block // compress_ratio * manager.head_dim * bytes_per_element
+    manager.impl = Mock()
+    manager.impl.get_mem_pool_base_address.side_effect = (
+        lambda layer, role, mode: pool_base
+        if mode == PageIndexMode.PER_LAYER
+        else pool_base + layer_offset * page_bytes
+    )
+    manager.impl.get_page_index_upper_bound.return_value = (pool_pages - layer_offset) * expansion
+    manager.impl.get_page_index_converter.return_value = SimpleNamespace(
+        layer_offset=layer_offset, expansion=expansion
+    )
+
+    # Inspect the raw view without dereferencing its synthetic GPU address.
+    with patch.object(deepseek_v4_cache, "convert_to_torch_tensor", side_effect=lambda view: view):
+        view = manager.get_buffers(0, DeepseekV4AttentionType.COMPRESS)
+
+    assert view.dtype == binding_to_torch_dtype(dtype)
+    assert (
+        view.data_ptr() + prod(view.shape) * bytes_per_element
+        == pool_base + pool_pages * page_bytes
+    )
+    if sparse:
+        assert view.data_ptr() == pool_base
+        assert view.shape == (pool_pages * expansion, 1, manager.head_dim)
+    else:
+        assert view.data_ptr() == pool_base + layer_offset * page_bytes
+        assert view.shape == (
+            pool_pages - layer_offset,
+            tokens_per_block // compress_ratio,
+            manager.head_dim,
+        )
 
 
 @pytest.mark.cpu_only

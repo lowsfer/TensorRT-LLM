@@ -12,6 +12,7 @@ import torch
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm.runtime.kv_cache_manager_v2 import Batch
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
 from .indexer import DeepseekV4Indexer
@@ -334,17 +335,16 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             tensor.fill_(value)
             return tensor
 
-        history_blocks = allocate("history_blocks", (batch,), 0)
+        native_batch = Batch(manager.impl, max_batch_size=batch, max_blocks_per_seq=max_blocks)
         self.sparse_offload_state = SparseOffloadState(
             layers=layers,
+            batch=native_batch,
             base_page_tables={
-                group: allocate(f"base_page_table_{group}", (batch, max_blocks), -1)
+                group: torch.from_dlpack(native_batch.page_table(group))
                 for group in sorted({descriptor.group_id for descriptor in layers.values()})
             },
-            history_blocks=history_blocks,
-            history_blocks_host=torch.zeros(
-                batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
-            ),
+            history_lengths=torch.from_dlpack(native_batch.history_lengths()),
+            history_blocks=allocate("history_blocks", (batch,), 0),
             active_request_count=allocate("active_request_count", (1,), 0),
             selected_history_pages=allocate(
                 "selected_history_pages", (batch, min(self.sparse_mla_topk, max_blocks)), -1
@@ -640,6 +640,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         assert self.kv_cache_manager is not None
         assert self.request_ids is not None
         self.validate_sparse_offload_batch()
+        self.kv_cache_manager._release_sparse_batch()
 
         self.kv_cache_manager.compute_sliding_block_tables(
             self.request_ids,

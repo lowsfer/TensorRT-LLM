@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferId, LayerGroupId
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import Batch, BufferId, LayerGroupId, _KVCache
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +53,10 @@ class SparseOffloadState:
     """Fixed-capacity storage owned by one serial attention metadata instance.
 
     All device tensors are int32. Tables are [B, M], selections are [B, S],
-    history counts are [B], and the active count is [1]. History staging is
-    pinned CPU memory. Layer workspaces are reused only after the previous
+    history counts are [B], and the active count is [1]. ``batch`` owns the
+    page tables, token history lengths, and their pinned staging. Live requests
+    occupy a contiguous prefix in attention input order; padded rows are empty.
+    Layer workspaces are reused only after the previous
     layer's attention has consumed them on the same stream. Concurrent
     forwards require separate metadata and KVCM scratch ownership.
 
@@ -71,9 +73,10 @@ class SparseOffloadState:
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
+    batch: Batch
     base_page_tables: dict[LayerGroupId, torch.Tensor]
+    history_lengths: torch.Tensor
     history_blocks: torch.Tensor
-    history_blocks_host: torch.Tensor
     active_request_count: torch.Tensor
     selected_history_pages: torch.Tensor
     fetched_page_table: torch.Tensor
@@ -82,7 +85,6 @@ class SparseOffloadState:
     debug_assert: bool = field(
         default_factory=lambda: os.environ.get("TLLM_DSV4_OFFLOAD_DEBUG_ASSERT", "0") == "1"
     )
-    history_upload_done: torch.cuda.Event = field(default_factory=torch.cuda.Event)
-    history_upload_pending: bool = False
+    kv_caches: dict[int, _KVCache] = field(default_factory=dict)
     prepared: bool = False
     is_prefill: bool = False
