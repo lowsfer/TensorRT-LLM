@@ -886,6 +886,40 @@ class GuidedDecodingConfig(StrictBaseModel):
         description="The stop token ids for guided decoding config.")
 
 
+class SparseKvCacheOffloadConfig(StrictBaseModel):
+    """Memory sizing for sparse attention KV cache offload.
+
+    With offload, the KV history a sparse attention layer selects from lives in
+    host memory, and each request keeps a GPU cache of the units its selections
+    name.
+    """
+    gpu_cache_factor: float = Field(
+        default=2.0,
+        ge=1.0,
+        status="prototype",
+        description=
+        "Size of each request's GPU cache for offloaded attention history, in "
+        "selections: the cache holds this many times the units one decode step "
+        "selects, plus the unit being written, rounded up to whole pages. A "
+        "larger cache keeps more history on the GPU between decode steps, so "
+        "fewer units are fetched from host memory, at the cost of GPU memory per "
+        "request.")
+    host_history_size: Optional[NonNegativeInt] = Field(
+        default=None,
+        status="prototype",
+        description=
+        "Pinned host memory in bytes, per rank, for offloaded attention history "
+        "and the staging buffers that publish it to the GPU. History pages share "
+        "slots with the GPU KV cache pools, so the GPU KV cache quota is lowered "
+        "when needed to stay within it. It is separate from "
+        "kv_cache_config.host_cache_size, the host tier that evicted KV cache "
+        "pages move to, and the two together must fit this rank's share of "
+        "available host memory and the pinned-memory limit. When unset, it "
+        "holds max_batch_size requests at kv_cache_config.avg_seq_len, or "
+        "max_seq_len when that is unset, capped by the host memory automatic "
+        "sizing may pin.")
+
+
 class BaseSparseAttentionConfig(StrictBaseModel):
     """Configuration for sparse attention."""
     algorithm: str
