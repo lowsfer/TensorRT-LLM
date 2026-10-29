@@ -1279,10 +1279,17 @@ class Batch:
         after**: a block must be in its host page before it can be selected, and
         :meth:`_KVCache.resize` refuses a history this has not covered.
 
-        Bounded by the capacity each row started from, not by how far history travels, so
-        a resumed request moving history across a whole prompt writes back nothing -- its
-        units reached their host pages directly rather than through a cell. A move wider
-        than the in-flight headroom is refused.
+        Only flush a history that is final -- one the row is going to take up. A history
+        past the row's capacity is refused: those units were never written, so they have
+        no cell to write back from.
+
+        Bounded by what was in flight, not by how far history travels, so a resumed request
+        moving history across a whole prompt writes back nothing -- its units reached their
+        host pages directly rather than through a cell. The bound is aggregate: the units
+        crossed, summed over rows, must fit the per-layer write-back list, which is sized
+        from ``max_total_input_tokens``. One prefilling row may therefore use the budget
+        several decoding rows leave unspent, and a batch that exceeds it is refused before
+        any work is issued.
 
         Reads the index table as of the last :meth:`publish`, which covers the blocks in
         range because they were allocated by an earlier step.
@@ -1498,10 +1505,12 @@ class Batch:
         which member is passed makes no difference -- but it must still be a whole
         layer's sparse buffers, as :meth:`fetch_sparse_pages` requires.
 
-        The miss list this leaves behind is read by every :meth:`fetch_resolved_pages`
-        that follows and is overwritten by the next resolve of the same selection, so
-        fetch each member layer before resolving the selection again. Both run on
-        ``stream``, so that ordering is the caller's only across streams.
+        The miss list and per-slot cell mapping this leaves behind are read by every
+        :meth:`fetch_resolved_pages` that follows, and they belong to the life cycle rather
+        than to the selection: the next resolve of *any* selection in the same life cycle
+        overwrites them. Fetch every member layer before resolving another selection there,
+        or those fetches copy the later selection's units. Both run on ``stream``, so that
+        ordering is the caller's only across streams.
         """
 
     def fetch_resolved_pages(
