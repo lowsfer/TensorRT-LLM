@@ -22,10 +22,11 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.agent import MemoryType
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -39,13 +40,13 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPool,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 pytestmark = pytest.mark.cpu_only
 
 
-def _manager(offload: bool) -> SimpleNamespace:
+def _manager(offload: bool) -> Mock:
     roles = ("compress", "compress_scale", "indexer")
     sizes = (288 * 32, 36 * 32, 144 * 32)
     layers = [
@@ -83,7 +84,11 @@ def _manager(offload: bool) -> SimpleNamespace:
             )
         ],
     )
-    return SimpleNamespace(
+    # The page-table builder accepts only a KVCacheManagerV2.
+    return Mock(
+        spec=KVCacheManagerV2,
+        get_disagg_pool_view_partition=None,
+        get_disagg_ignored_roles=lambda: frozenset(),
         impl=impl,
         pp_layers=[0, 1],
         num_kv_heads_per_layer=[1, 1],

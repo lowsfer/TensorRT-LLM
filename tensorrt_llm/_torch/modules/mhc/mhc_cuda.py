@@ -862,7 +862,9 @@ class MhcFusedHcRunner(TunableRunner):
     + auto bs).
 
     ``FORCE_DETERMINISTIC=1`` or ``FORCE_MHC_KERNEL_DETERMINISTIC=1`` uses a
-    fixed half-fused tactic with one K split for tuned and fallback execution.
+    fixed half-fused tactic with one K split for tuned and fallback execution,
+    except that the FMA fallback tactic is kept: ``mhc_fused_hc`` passes it under
+    ``FORCE_DETERMINISTIC=1`` for its row-count-independent reduction order.
     """
 
     tuning_config = TuningConfig(
@@ -999,9 +1001,12 @@ class MhcFusedHcRunner(TunableRunner):
         hc_base_cur = hc_base_cur.to(torch.float32).contiguous()
 
         pre_mix_ext = kwargs.get("pre_mix_ext")
-        if self._force_deterministic or tactic == -1:
+        if tactic == -1 or (self._force_deterministic and tactic != _FUSED_HC_FALLBACK_TACTIC_FMA):
             # One fixed tactic avoids both atomic split-K reductions and
             # arithmetic changes from independently tuned rank/process choices.
+            # The FMA fallback stays: it has neither, and mhc_fused_hc passes it
+            # under FORCE_DETERMINISTIC because its reduction order does not
+            # depend on the number of rows.
             tactic = _get_fused_hc_fallback_tactic(
                 self.hidden_size, deterministic=self._force_deterministic
             )

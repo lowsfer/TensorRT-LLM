@@ -1238,7 +1238,9 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
     return runner, inputs
 
 
-@pytest.mark.parametrize("num_tokens", [1, 129])
+# 300 rows take a different automatic BigFuse block size than one row, which the
+# row-invariance check below must not see.
+@pytest.mark.parametrize("num_tokens", [1, 129, 300])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("fuse_norm", [False, True])
 @pytest.mark.parametrize("lagged", [False, True])
@@ -1300,6 +1302,15 @@ def test_mhc_fused_hc_force_deterministic(
     single_pre_mix = pre_mix_ext[row : row + 1].clone() if pre_mix_ext is not None else None
     for actual, reference in zip(run(single_inputs, single_pre_mix), expected, strict=True):
         torch.testing.assert_close(actual, reference[row : row + 1], rtol=0, atol=0)
+    # Nor may splitting the batch, which checks every row.
+    half = (num_tokens + 1) // 2
+    for start, stop in ((0, half), (half, num_tokens)):
+        if start == stop:
+            continue
+        part_inputs = [v[start:stop].clone() for v in inputs[:4]] + inputs[4:]
+        part_pre_mix = pre_mix_ext[start:stop].clone() if pre_mix_ext is not None else None
+        for actual, reference in zip(run(part_inputs, part_pre_mix), expected, strict=True):
+            torch.testing.assert_close(actual, reference[start:stop], rtol=0, atol=0)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
