@@ -93,7 +93,7 @@ entry and the selection unit is already a page.
 4. **All GPU residency is the per-request cache**, which is a dedicated arena rather than a
    storage tier. A sparse buffer has no separately managed GPU pages: both the block being
    written and the history a step selects occupy cache cells, drawn from the same lease and
-   replaced by the same LRU.
+   replaced by the same eviction.
 5. **The host page is authoritative once the watermark passes the block.** A block reaches
    its host page through `Batch::flushSparseUnits()`, which the caller runs before the
    `resize()` that raises `history_length` past it; `resize()` checks that flush has
@@ -218,7 +218,7 @@ watermark — and the second is written by definition. So the two populations ar
 distinguished by the ordinal alone:
 
 ```
-unflushed  <=>  resident_ordinal >= history_length / unit_tokens
+unflushed  <=>  entry_ordinal >= history_length / unit_tokens
 ```
 
 Nothing records this. History is monotonic (`resize()` rejects a decrease), so an ordinal
@@ -330,8 +330,9 @@ answer "which block does this page hold", and it has no answer.
 
 ## Device-side cache
 
-Per `(request, layer)`, managed entirely by kernels: a resident set, an LRU queue and a
-free list.
+Per `(request, layer)`, managed entirely by kernels: one 32-bit word per entry, holding
+the unit resident there and when that unit was last used. A free entry is a value of the
+same word, so there is no separate free list.
 
 **Scope is per `(request, layer)`, never per KV head.** Every head of a layer shares one
 resident set, because a selection unit is the tokens it spans across all of them. A layer
@@ -350,11 +351,24 @@ through their own request's page table, so a host slot can never be recycled und
 surviving entry. A global, provenance-keyed cache would give cross-request sharing for
 free via the radix tree, but needs generation counters or an invalidation pass; deferred.
 
-**Replacement is true LRU**, not "evict whatever was not selected this step". Entries that
-hit are promoted above newly fetched misses, so a unit selected repeatedly outranks a
-first-time selection and one-off selections leave first. Retention across steps is the
-point: HiSparse reports a large miss-rate reduction from holding hot entries beyond the
-current top-k, which is only possible when the cache is larger than the selection width.
+**Replacement is by age, not "evict whatever was not selected this step".** Retention
+across steps is the point: HiSparse reports a large miss-rate reduction from holding hot
+entries beyond the current top-k, which is only possible when the cache is larger than the
+selection width.
+
+An entry's word carries a 7-bit step timestamp and one history bit saying whether its last
+use found it already resident. Eviction takes the highest `2 * age - history`, so age
+decides and, within one age, a unit fetched that step leaves before one that was hit — which
+is what makes a repeatedly selected unit outrank a first-time selection. The order is
+therefore approximate where an exact recency permutation would be exact: two entries of the
+same age and the same history bit are interchangeable, and which of them leaves is whichever
+thread reaches the oversubscribed bucket first.
+
+The clock wraps, so a timestamp left untouched for longer than its range would read as a
+recent one. Every resolve streams every entry anyway, so one resolve in every
+`kRebaseStep` pulls the timestamps it passes up to the oldest age the field still
+distinguishes. That is idempotent, which is what lets the write-index path apply it too
+without the two having to agree on which of them does.
 
 **Residency is tracked by a reverse map** — a dense array indexed by slot `0..N-1` holding
 the resident unit ordinal, N entries per `(request, layer)` — not a forward map from
@@ -366,7 +380,8 @@ ordinal to slot. The two scale with different things:
 | reverse, slot → ordinal | batch × layers × **N** | proportional to cache already bought |
 
 The forward map is proportional to context length, the quantity this feature exists to
-stop paying for. The dense reverse form is also what the LRU order and free list want.
+stop paying for. The dense reverse form is also what the eviction pass wants: it reads every
+entry once either way.
 
 ### Probe index
 
@@ -385,32 +400,47 @@ by the cache's capacity `N`:
 for (int32_t i = threadIdx.x; i < required; i += kThreads) {
     int32_t ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
     if (ord < 0) continue;
-    uint32_t pos = slotOf(ord, mask);
-    int32_t key = atomicCAS(&keys[pos], kEmptyKey, ord);
-    while (key != kEmptyKey && key != ord) { pos = (pos + 1U) & mask; key = atomicCAS(...); }
+    table.insert(ord, mask);                       // one CAS per probe step
 }
 __syncthreads();
 
 for (int32_t s = threadIdx.x; s < entries; s += kThreads) {   // the resident set
-    int32_t ord = residentOrdinal[s];
-    cls[s] = kClassUntouched | (ord >= historyUnits ? kPinned : 0);
-    previousLru[s] = lruOrder[s];
-    if (ord == kFreeOrdinal) continue;
-    ... find ord in the table ...
-    if (key == ord) vals[pos] = s;        // the resident entry claims its query
+    uint32_t word = entry[s];
+    entryCache[s] = word;
+    int32_t ord = SparseEntry::ordinal(word);
+    bool matched = ord >= 0 && table.publish(ord, s, mask);   // claims its query
+    flag[s] = matched ? kFlagMatched : (ord >= historyUnits ? kFlagHeld : kFlagEvictable);
+    if (flag[s] == kFlagEvictable) atomicAdd(&hist[staleness(word)], 1);
 }
 ```
 
 Open addressing with linear probing, capacity `next_pow2(2 * required)` so the load factor
 stays at or below one half, which also guarantees an unsuccessful probe terminates on an
-empty entry. Keys and values are separate arrays rather than packed 64-bit entries: a
-`__syncthreads()` separates build from match, so no thread reads an entry mid-insert and the
-value needs no atomicity, keeping the CAS 32-bit. Multiplicative hashing rather than
-identity, because ordinals are small and dense, and dense runs make an unsuccessful probe
-walk the whole run.
+empty entry. A position is a single 32-bit word holding both the ordinal and the entry that
+claimed it: a `__syncthreads()` separates build from match, so no thread reads a position
+mid-insert and the entry index needs no atomicity of its own. Packing them halves the
+shared-memory traffic of the publish pass, which walks the whole resident set and is where
+most of the kernel's time goes. The split is 14 bits of entry index against 18 of ordinal,
+and both bounds are checked rather than truncated into.
 
-The resident sweep is also where per-entry recency and pin state are cached, so the pass
-the match needs is the pass the eviction ranking needs; see "Capacity and eviction".
+Multiplicative hashing rather than identity, because ordinals are small and dense, and dense
+runs make an unsuccessful probe walk the whole run.
+
+The table stays at `next_pow2(2 * required)` rather than being right-sized to a load factor
+of one half. Right-sizing measured *slower*: the publish pass is dominated by *unsuccessful*
+probes, whose expected cost is `0.5 * (1 + 1/(1-a)^2)` and so rises much faster in the load
+factor `a` than a successful probe's does.
+
+The resident sweep is also where each entry is classified and its staleness binned, so the
+pass the match needs is the pass the eviction ranking needs; see "Capacity and eviction".
+
+**The CTA width is chosen per life cycle.** Every pass but the probe is a stride loop over
+the resident set, so doubling the CTA halves what a thread walks — but only pays while
+shared memory already holds a multiprocessor to one or two blocks of the kernel. Past that
+the wider CTA buys nothing per block and costs residency. The kernel is therefore
+instantiated at 256 and 512 threads, and the launcher picks between them by asking the
+device for the narrow instantiation's occupancy at this shape's shared-memory size. The
+three extents are the life cycle's, so the answer is computed once and held.
 
 **This reverses an earlier decision, deliberately.** The index was first built over the
 *resident* set, keyed by ordinal and valued by slot, sized `next_pow2(2N)`. That was argued
@@ -438,8 +468,9 @@ Measured on DSA at the geometry above, the resolve kernel fell from 1.468 to 0.8
 decode step summed across 21 sparse layers.
 
 A reservation-only call -- `prepare_sparse_write_indices`, which has no selection -- skips
-the table entirely and runs a separate kernel that scans the recency order for its single
-in-flight ordinal. See "Writing the in-flight unit".
+the table entirely and runs a separate kernel that scans the entry words for its single
+in-flight ordinal, reusing it where a previous step already pinned it and taking the stalest
+candidate otherwise. See "Writing the in-flight unit".
 
 ## Extraction interface
 
@@ -514,14 +545,14 @@ worth more than the code it would have taken to build.
 
 ### Kernel structure
 
-The descriptor path crosses **no plugin boundary**. KVCM2 resolves selections, updates LRU,
-allocates cells and performs the copies itself, because a layout is data it can interpret
-rather than code it must call.
+The descriptor path crosses **no plugin boundary**. KVCM2 resolves selections, updates the
+eviction state, allocates cells and performs the copies itself, because a layout is data it
+can interpret rather than code it must call.
 
 It is two launches — a resolve and a copy — but that split is internal and chosen, not
 forced: the resolve writes a miss list the copy consumes, which is what lets the PCIe
-copies be issued before the recency bookkeeping. Fusing them would be a local optimisation,
-not an interface change.
+copies start while the resolve is still finishing. Fusing them would be a local
+optimisation, not an interface change.
 
 There is no second path to fuse with, so the structure is final rather than a first stage.
 
@@ -576,13 +607,13 @@ logic on identical input.
 
 A model that runs one indexer across a run of layers hands them all the *same* selection
 every step. Resolving it per layer computes the same answer as many times as there are
-layers, each against its own resident set and recency order — and they cannot diverge,
+layers, each against its own resident set — and they cannot diverge,
 because `initialiseLease` clears every row alike and identical input then evolves
 identically. So the copies are of one answer, paid for in kernel launches and in
 `entriesPerSelection` of metadata per layer.
 
 Those layers instead name one `selection_id`. Members of a selection share **one** resident
-set, one recency order, one in-flight reservation and one miss list. The cells stay per
+set, one in-flight reservation and one miss list. The cells stay per
 layer and are *mirrored*, exactly as a layer's K and k-scale mirror today: the entry index
 is shared, the bytes behind it are not. `entriesPerSelection` is the metadata's first
 dimension, and `layerSelection[layer]` is where a layer reads it — the identity where every
@@ -605,7 +636,7 @@ second layer's cells unfilled.
 
 The copy kernel needed no change for any of this. It consumes a work list plus a buffer
 range, and nothing in it depended on which layer produced the list. Neither did the
-write-back: `sparseResolveKernel` is the only writer of `residentOrdinal`/`lruOrder`, and
+write-back: `sparseResolveKernel` is the only writer of the lease's entry words, and
 `sparseFlushListKernel` only reads them — so collapsing the resolve is sufficient, and a
 per-layer flush against shared metadata stays correct.
 
@@ -629,9 +660,10 @@ Each call then:
 1. read the selection: unit ordinals, uniform width, `-1` padded;
 2. build the probe index over the required ordinals — in-flight units, then the selection;
 3. stream the resident set past it: a match is a hit with its slot, the rest are misses;
-4. allocate a slot per miss from the free list, evicting LRU when empty;
+4. allocate a slot per miss, taking the stalest entries first;
 5. extract and copy each miss from the device-mapped host page;
-6. promote hits above new misses in recency order;
+6. stamp every entry the step used with the current step, flagged by whether it was already
+   holding its unit;
 7. write the output index list: one index per selection slot, in the selection's own
    order, `kBadPageIndex` where a slot is padded.
 
@@ -647,9 +679,9 @@ One index per buffer, though. A layer's buffers share the resolve but not their 
 the list carries a buffer dimension: `[row][buffer][selection]`, which is also the single
 tensor covering K and V that attention kernels tend to want.
 
-Steps 5 and 6 are independent. Because the probe in step 3 resolves misses directly, the
-copies — the only step that touches PCIe, and so the long pole — can be issued before the
-recency bookkeeping runs rather than after it.
+Steps 4 and 6 are one pass: an entry's new word is written where its fate is decided, so
+nothing is left to do after the work list is complete. The copies — the only step that
+touches PCIe, and so the long pole — are released as soon as that pass ends.
 
 No host involvement, so the call enqueues and returns. Every shape is static across steps.
 
@@ -751,7 +783,7 @@ there is nothing to write back and no converted table is needed yet.
 Capacity is guaranteed by reservation, not back-pressure: a fetch can always satisfy its
 own layer, because the reservation covers a full selection width. Within a step a fetch may
 evict entries of layers already processed but never one a later kernel still needs, which
-LRU recency delivers — layer N's entries are most-recently-used when layer N+1 fetches.
+the step clock delivers — layer N's entries are at age zero when layer N+1 fetches.
 
 An entry is evictable only when its unit ordinal is **below the watermark**. That is what
 protects the block being written, and it is a correctness predicate rather than a policy
@@ -1025,7 +1057,7 @@ host pool is reached only by this manager's own copies, which compute their offs
 
 A layer declares its fetch path with `sparse_cache`, and layers sharing a life cycle must
 currently declare the same one. The arena is per life cycle and its metadata is a single
-stride — a selection's rows live at `residentOrdinal + slot * entriesPerSelection` — so one
+stride — a selection's rows live at `entry + slot * entriesPerSelection` — so one
 entry count serves every layer, and `cellsPerBuffer` follows from `max_cached_units` and the
 unit size together.
 
@@ -1037,8 +1069,8 @@ That is an implementation limit, not a property of the design. Lifting it:
   whose unit is half the cell's just has twice the divisor.
 - **Require unit sizes to be powers of two**, so every such division is exact and a buffer's
   bytes split without remainder at any level.
-- The resident set and the recency order are **already per selection**, so they need no
-  change; only the entry count and the divisor become per layer rather than per life cycle.
+- The entry words are **already per selection**, so they need no change; only the entry
+  count and the divisor become per layer rather than per life cycle.
 
 Until then a mismatch is rejected at construction. It was previously taken as a `max` across
 the life cycle, which quietly served one layer's shape to another.
@@ -1191,11 +1223,10 @@ block that has not yet waited may still be running beside a grid that could read
 would overwrite, and the cost of keeping the rule is a few stores.
 
 The producers release as early as they correctly can. The resolve's work list is final at
-the end of its eviction loop, and everything after that — the recency rebuild, three block
-scans over the resident set — is its own bookkeeping that nothing downstream reads; it calls
-`cudaTriggerProgrammaticLaunchCompletion()` there and hands the copy that whole tail as
-overlap. The flush-list scan has no such tail, since the list is the last thing it writes,
-so its release only brings the copy's launch forward.
+the end of its eviction loop, which is also where the entry words are written, so it calls
+`cudaTriggerProgrammaticLaunchCompletion()` there and only its miss count follows. The
+flush-list scan is the same shape — the list is the last thing it writes — so in both cases
+the release brings the copy's launch forward rather than overlapping a tail.
 
 The copy releases immediately after its own wait. That looks wrong and is not: the kernel
 that follows it on the stream builds the attention index table from the resolve's slots and
@@ -1392,7 +1423,7 @@ a block the window has made stale is never named. Nothing reads an unlocked page
 can read one that has been encoded or recycled.
 
 A cell fetched before the window moved does outlive its page's lock there. It is harmless:
-nothing names it again, so the LRU evicts it within a few steps. The write-back is
+nothing names it again, so it ages out within a few steps. The write-back is
 unaffected in either case — the units it crosses lie in `[history, capacity)`, above the
 watermark `_unlockStaleBlocks` works from, so their pages are locked for as long as the
 request is active.
@@ -1413,7 +1444,7 @@ Recorded because each looks like an open question and is not:
   free-list push. Flushes are triggered by the watermark alone, never by eviction pressure.
 - **Pinning is not a general scheme.** The pinned set is the in-flight unit, private
   because unflushed blocks are not in the radix tree, and bounded to one by
-  `max_input_length`. Ordering between the rest still comes from LRU recency alone.
+  `max_input_length`. Ordering between the rest still comes from staleness alone.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not the sparse granularity lever**, and is rejected on a
   sparse buffer. `sparse_selection_unit_tokens` is — see *Extraction interface*.

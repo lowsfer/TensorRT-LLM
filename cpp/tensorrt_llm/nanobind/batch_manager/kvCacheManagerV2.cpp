@@ -2468,20 +2468,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         nb::arg("batch"));
     mIntrospection.def(
         "sparse_resolve",
-        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
+        [](std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,
             int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
             std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
             std::vector<int32_t> const& inactiveRows)
         {
-            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, lruOrder, numLayers, entriesPerLayer,
+            auto r = kv::KvCacheIntrospection::sparseResolve(residentOrdinal, entryAge, numLayers, entriesPerLayer,
                 selected, selectionWidth, historyUnits, capacityUnits, maxInFlightUnits, inactiveRows);
             // No gil_scoped_release call guard: the tuple below is built from the lambda body,
             // which the guard would have left running without the GIL.
-            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.lruOrder), std::move(r.outSlot),
-                std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot), std::move(r.missTotal),
-                std::move(r.missCount), std::move(r.inFlightSlot));
+            return std::make_tuple(std::move(r.residentOrdinal), std::move(r.entryAge), std::move(r.entryHit),
+                std::move(r.outSlot), std::move(r.missRow), std::move(r.missOrdinal), std::move(r.missSlot),
+                std::move(r.missTotal), std::move(r.missCount), std::move(r.inFlightSlot));
         },
-        nb::arg("resident_ordinal"), nb::arg("lru_order"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
+        nb::arg("resident_ordinal"), nb::arg("entry_age"), nb::arg("num_layers"), nb::arg("entries_per_layer"),
         nb::arg("selected"), nb::arg("selection_width"), nb::arg("history_units"), nb::arg("capacity_units"),
         nb::arg("max_in_flight_units"), nb::arg("inactive_rows"));
     mIntrospection.def("sparse_unit_copy", &kv::KvCacheIntrospection::sparseUnitCopy, nb::arg("host_pool"),

@@ -117,22 +117,20 @@ class SparseArenaShape:
         """Cache entries of one lease: one per cached unit of each selection.
 
         Per selection, not per layer: layers sharing a selection hold the same units
-        in mirrored cells, so one resident set and one recency order serve them all.
+        in mirrored cells, so one resident set serves them all.
         """
         return self.num_selections * self.cells_per_buffer * self.units_per_cell
 
     @property
     def lease_metadata_bytes(self) -> int:
-        """Bytes of one lease's residency and recency state.
+        """Bytes of one lease's residency and eviction state.
+
+        One word per entry: the unit it holds and when that unit was last used.
 
         The reservation only. A step's work lists belong to the Batch, not to a lease:
         they are sized by the batch and reused by whichever requests are seated.
         """
-        arrays = (
-            self.entries,  # residentOrdinal
-            self.entries,  # lruOrder
-        )
-        return sum(_index_array_bytes(n) for n in arrays)
+        return _index_array_bytes(self.entries)
 
     @property
     def lease_bytes(self) -> int:
@@ -158,7 +156,6 @@ class SparseArenaShape:
             num_buffers,  # layer of each buffer
             num_buffers,  # slot of each buffer in its pool
             self.num_layers,  # metadata row each layer resolves within
-            self.entries,  # recency order a lease starts from
         )
         shared = sum(_index_array_bytes(n) for n in shared_arrays)
         return cell_regions + shared + max_leases * self.lease_metadata_bytes

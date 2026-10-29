@@ -161,13 +161,13 @@ def test_units_per_page(unit_tokens: int | None, units_per_page: int) -> None:
 @pytest.mark.parametrize(
     ("cells", "lease_bytes"),
     [
-        # 21 layers x cells x (9216 B data + 1152 B scale), plus two int32 arrays
-        # per cached row. A lease holds the reservation and nothing of the step: the
+        # 21 layers x cells x (9216 B data + 1152 B scale), plus one int32 word per
+        # cached entry. A lease holds the reservation and nothing of the step: the
         # work lists belong to the Batch, sized by the batch rather than by whoever
         # is seated.
-        (17, 3_793_024),
-        (32, 7_139_328),
-        (33, 7_362_688),
+        (17, 3_747_200),
+        (32, 7_053_312),
+        (33, 7_273_856),
     ],
 )
 def test_lease_matches_native_layout(cells: int, lease_bytes: int) -> None:
@@ -199,7 +199,7 @@ def test_arena_follows_the_batch_rows() -> None:
     (shape,) = sparse_arena_shapes(config.layers, tokens_per_block=TOKENS_PER_BLOCK)
 
     assert shape == V4_FLASH_ARENA
-    assert shape.lease_bytes == 7_362_688
+    assert shape.lease_bytes == 7_273_856
     assert sparse_arena_bytes(config, 513) == shape.arena_bytes(513)
 
 
@@ -672,7 +672,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert capacity.by_limit == {"max_batch_size": 256, "host": 4, "gpu": 794}
     assert capacity.limited_by == "host"
     assert capacity.fits == 4
-    assert capacity.lease_bytes == 7_362_688
+    assert capacity.lease_bytes == 7_273_856
     assert capacity.arena_bytes == V4_FLASH_ARENA.arena_bytes(256)
     # The 50 GiB host budget holds 240 requests of 128K tokens; the GPU budget
     # would hold more.
