@@ -130,15 +130,15 @@ already be in its host page.
 to set. The Batch records it; `resize()` then *checks* against that record rather than
 flushing anything itself.
 
-The flush used to live inside `resize()`, on the grounds that it was the single chokepoint
-through which `setHistoryLength` and `setCapacity` both pass. That reasoning held, but it
-bought the chokepoint at the price of hiding an ordering requirement: the write-back reads
-converted page indices, which only a publish produces, so a flush buried in `resize()` was
-silently depending on when the last publish happened. Naming the flush makes that a stated
-precondition of a call the caller issues.
+The flush is a call of its own rather than a step inside `resize()`, for two reasons.
 
-It is also what lets the write-back be **batch-wide**. Per request, it was one scan and one
-copy launch per pool *per row*, plus two synchronous host-to-device copies to tell the
+It carries an ordering requirement that only a caller can satisfy: the write-back reads
+converted page indices, and only a publish produces those. A flush reached through
+`resize()` would depend on when the last publish happened without saying so; a named call
+makes it a stated precondition.
+
+It is also what lets the write-back be **batch-wide**. Per request it would be one scan and
+one copy launch per pool *per row*, plus two synchronous host-to-device copies to tell the
 kernel which units moved. Driven from the Batch it is one scan over `(layers, rows)` and one
 copy launch per pool for the whole step, with a single small upload of per-row ranges.
 
@@ -147,12 +147,28 @@ row more than once, and a row whose growth failed rolls back to a history below 
 was flushed for it. Flushing early is always safe — a flush is a copy, and a block flushed
 before a failed resize stays correctly flushed. Only flushing late is not.
 
-`commit()` needs no flush site of its own: the manager maintains
-`num_committed_tokens <= history_length <= capacity`, so a committed block is already at or
-below the watermark and was flushed before the watermark passed it.
-
 `history_length` therefore keeps two jobs: it defines selection eligibility, and it is the
 flush deadline.
+
+**The neighbouring hooks are not flush sites, and each would be wrong as one.**
+
+- `resize()` is where the watermark moves, and it is the only such place: `setHistoryLength`
+  is `resize(nullopt, hist)` and `setCapacity()` is `resize(cap, nullopt)`, and one call may
+  move capacity and history together. A check placed anywhere else would see only half the
+  moves.
+- `_unlockStaleBlocks` exists for SWA blocks outside the window, whose content is *dead*;
+  sparse history is live and will be read again. The trigger and the range arithmetic match,
+  the disposition does not — routing sparse layers through it would drop the data rather
+  than write it back. It also gates on `windowSize.has_value()`, so for a full-attention
+  sparse layer it fires on nothing.
+- `_shortcutSetHistoryLength` returns "unchanged" when no SWA stale range moved, and for a
+  full-attention layer `windowSize.has_value()` is false, so nothing is ever reported as
+  moved: it assigns `mHistoryLength`, returns true, and `resize()` returns before reaching
+  its body. Work placed in that body does not run for a sparse layer.
+- `commit()` needs no flush site: the manager maintains
+  `num_committed_tokens <= history_length <= capacity`, so a committed block is already at or
+  below the watermark and was flushed by the `resize()` that passed it. Where `commit()`
+  advances the watermark it does so by calling `resize()`.
 
 ### How much a step may cross
 
@@ -236,8 +252,9 @@ keep this from being a general write-back cache:
 - **Unflushed entries are private.** Only finalized pages enter the radix tree, so an
   unflushed block has exactly one owner: no aliasing, no cross-request coherence, no
   concurrent writers.
-- **The unflushed set is at most one unit**, not discovered — see `max_input_length` below.
-  Reservation covers it, so a fetch never meets a cache with nothing to evict.
+- **The unflushed set is at most one unit**, bounded by `max_input_length` below rather
+  than observed at runtime. Reservation covers it, so a fetch never meets a cache with
+  nothing to evict.
 
 Eviction eligibility is therefore one comparison against the watermark. There is no
 evict-an-unflushed-entry path to implement: such an entry is simply not a candidate, and
@@ -322,7 +339,7 @@ filled together; the cache took whole coalesced slots only while it drew them fr
 storage allocator, which deals in slots. A dedicated arena has no such constraint, and
 dropping it removes a page lookup from both the copy and the index kernel.
 
-The consequence worth stating is that **a cache cell is not a page**. It holds one buffer's
+The consequence is that **a cache cell is not a page**. It holds one buffer's
 unit, identified by `(buffer, entry index)` rather than by a block ordinal. This breaks an
 assumption that runs through KVCM2 — that a page is both the unit of allocation *and* the
 unit of identity — which is precisely why the cache is not a storage tier: it would have to
@@ -345,16 +362,16 @@ is a real exclusion rather than a hypothetical: Rocket's selection indices are
 choose per head. Serving them would need a resident set per `(request, layer, head)`, which
 multiplies the metadata and the reservation by the head count.
 
-**Scope is per request.** Two requests sharing a prefix do not share a cached copy. This
-matches HiSparse and closes a soundness hole by construction: entries are reachable only
-through their own request's page table, so a host slot can never be recycled underneath a
-surviving entry. A global, provenance-keyed cache would give cross-request sharing for
-free via the radix tree, but needs generation counters or an invalidation pass; deferred.
+**Scope is per request.** Two requests sharing a prefix do not share a cached copy. That
+closes a soundness hole by construction: entries are reachable only through their own
+request's page table, so a host slot can never be recycled underneath a surviving entry.
+A global, provenance-keyed cache would give cross-request sharing for free via the radix
+tree, but needs generation counters or an invalidation pass; not supported.
 
 **Replacement is by age, not "evict whatever was not selected this step".** Retention
-across steps is the point: HiSparse reports a large miss-rate reduction from holding hot
-entries beyond the current top-k, which is only possible when the cache is larger than the
-selection width.
+across steps is the point: holding hot entries beyond the current top-k gives a large
+miss-rate reduction (HiSparse reports the measurement), and that is only available when
+the cache is larger than the selection width.
 
 An entry's word carries a 7-bit step timestamp and one history bit saying whether its last
 use found it already resident. Eviction takes the highest `2 * age - history`, so age
@@ -442,30 +459,27 @@ instantiated at 256 and 512 threads, and the launcher picks between them by aski
 device for the narrow instantiation's occupancy at this shape's shared-memory size. The
 three extents are the life cycle's, so the answer is computed once and held.
 
-**This reverses an earlier decision, deliberately.** The index was first built over the
-*resident* set, keyed by ordinal and valued by slot, sized `next_pow2(2N)`. That was argued
-for on the grounds that hashing the selection would leave the miss list unknown until the
-resident walk finished. The argument does not hold: the resident-keyed build had to walk
-every slot and cross a `__syncthreads()` before its first probe, so the misses were never
-known any earlier. What the choice really bought was one fewer pass -- the probe returned a
-hit's slot directly, where the selection-keyed form needs a third pass of size `k` to read
-the slots back out of the table.
+**The index is keyed by the selection, not by the resident set.** The alternative — keying
+by ordinal and valuing by slot, sized `next_pow2(2N)` — returns a hit's slot straight from
+the probe and so saves one pass. It does not make the miss list available any sooner, as
+might be supposed: that build has to walk every slot and cross a `__syncthreads()` before
+its first probe, so the misses are known no earlier either way.
 
-What the reversal costs, and why it is still worth it:
+What keying by the selection costs, and what it buys:
 
-- **Shared memory falls from O(N) to O(k).** At the DSA geometry the table drops from 8192
-  buckets to 2048. This is the whole point: `N` now costs linear per-entry scratch rather
-  than a `next_pow2`-rounded table, so the quantity bounding how large a cache one launch
-  can serve is the selection width, not the capacity.
+- **Shared memory is O(k), not O(N).** At the DSA geometry the table is 2048 buckets rather
+  than 8192. This is the point of the choice: `N` costs linear per-entry scratch rather than
+  a `next_pow2`-rounded table, so the quantity bounding how large a cache one launch can
+  serve is the selection width, not the capacity.
 - **A third pass of size `k`** resolves hits from the table. Shared-memory only, and small
   against the resident sweep.
-- **The index build no longer precedes the dependency wait.** The resident-keyed build read
-  only the layer's own residency table, so it could run while the producing kernel was still
+- **The index build cannot precede the dependency wait.** A resident-keyed build reads only
+  the layer's own residency table and could run while the producing kernel was still
   draining; hashing the selection cannot, because the selection is what the producer
-  produces. Only shared-memory initialisation now sits above the wait.
+  produces. Only shared-memory initialisation sits above the wait.
 
-Measured on DSA at the geometry above, the resolve kernel fell from 1.468 to 0.833 ms per
-decode step summed across 21 sparse layers.
+On DSA at the geometry above, the resolve kernel takes 0.833 ms per decode step summed
+across 21 sparse layers, against 1.468 ms for the resident-keyed form.
 
 A reservation-only call -- `prepare_sparse_write_indices`, which has no selection -- skips
 the table entirely and runs a separate kernel that scans the entry words for its single
@@ -584,7 +598,7 @@ NVFP4 while leaving the active GPU cache alone, and `triattention`, which evicts
 periodically during decode.
 
 So "can sparse history be compressed" reduces to "does a sparse page reach the codec", and
-it does. Worth stating precisely which pages, because two true sentences sound like one:
+it does. Which pages, precisely, because two true sentences sound like one here:
 sparse history is *hot* -- host-backed, but hot -- and a cold-page codec compresses pages
 on their way to a **cold** tier. Sparse history is therefore compressed once demoted, at
 which point the codec applies with nothing sparse-specific, and not before.
@@ -946,16 +960,15 @@ following the existing `mark_stats_dirty` / `clear_stats_dirty` /
 `get_dirty_stats_kv_cache_ids` pattern. Until then a step restages the whole table, which is
 a cost rather than a wrong answer.
 
-Rejecting direct mutation instead was considered and rejected: `commit` changes locks and
-runs every decode step, so strictness would require a batched twin for every mutator before
-anything could ship. Dirty tracking degrades into a slower step rather than a wrong answer.
-A debug-mode check can still flag direct mutation while batched.
+Direct mutation of a seated member is permitted rather than refused. Refusing it would need
+a batched twin for every mutator — `commit` changes locks and runs every decode step — and
+the failure it would prevent is a restaged table, which costs a step rather than giving a
+wrong answer. A debug-mode check can still flag direct mutation while batched.
 
-**Batched resize** resizes every member and publishes once at the end. It may initially
-forward to `_KVCache.resize()`; the committed contract is row order and
-publish-on-completion, which survives the later coalescing work. The result is per-request,
-not a single flag, since `_KVCache.resize()` already rolls back per cache; a table published
-after a partial failure must reflect the post-rollback state.
+**Batched resize** resizes every member and publishes once at the end. The contract is row
+order and publish-on-completion, which holds however the resize itself is implemented. The
+result is per-request rather than a single flag, since `_KVCache.resize()` rolls back per
+cache and a table published after a partial failure must reflect the post-rollback state.
 
 **Rows are slots.** Removing a request leaves a hole to be reused rather than shifting later
 rows, which would invalidate the whole table and destabilise the shapes graph capture needs.
@@ -980,7 +993,7 @@ reservation upper bound, in the same units).
 
 N should be `2k`–`4k`, not `k`. `k` is the correctness floor — it guarantees a fetch can
 satisfy its layer — but it leaves no room for retention, and retention across steps is
-where the hit rate comes from. HiSparse finds `B ∈ [2k, 4k]` the useful range.
+where the hit rate comes from. That range is the one HiSparse measures as useful.
 
 There is no separate budget for in-flight blocks. The sparse pool's GPU tier holds nothing
 but cache cells, and an in-flight block occupies one of the same cells the selection draws
@@ -1017,41 +1030,21 @@ to distinguish an absent block from slot zero.
 Device arrays are typed by a `DeviceArray` protocol over DLPack, so callers pass torch
 tensors without this package depending on torch.
 
-## Implementation notes
+## Lock levels
 
-Slot release is already level-aware: `Page::~Page()` releases with the page's own
-`cacheLevel`, and the `kHotLevel` in `ScratchSlotLock::unlock()` is correct, since SWA
-prefill scratch is GPU-only by definition.
+Slot release is level-aware: `Page::~Page()` releases with the page's own `cacheLevel`, and
+the `kHotLevel` in `ScratchSlotLock::unlock()` holds because SWA prefill scratch is GPU-only
+by definition.
 
-- **`_lockHeldBlocks` carries no level hazard.** The OOM rollback for `resize` re-locks at
-  the hot level, which is where every buffer locks,
-  so a page table's entries and the level its pages lock at cannot disagree. Nothing carries
-  a per-target lock level: there is no `queryLockLevel`, no `BatchedLockTarget::cacheLevel`,
-  no `StaleBackup::cacheLevel` and no `residencyLevel`.
-- **`_unlockStaleBlocks` is not the flush hook.** It exists for SWA blocks outside the
-  window, whose content is *dead*; sparse history is live and will be read. Same trigger and
-  range arithmetic, different disposition — routing sparse layers through it drops the data
-  instead of flushing it. It also gates on `windowSize.has_value()`, so for a full-attention
-  sparse layer it fires on nothing.
-- **`_shortcutSetHistoryLength` skips the flush for exactly our configuration.** It reports
-  "unchanged" when no SWA stale range moved, and for a full-attention layer
-  `windowSize.has_value()` is false, so nothing is ever reported as moved: it assigns
-  `mHistoryLength` and returns true, and `resize()` returns early before reaching its body.
-  A flush placed in that body never runs. The shortcut must either carry the flush or be
-  declined while a sparse flush is pending.
-- **Hook `resize()`, not `setHistoryLength()`.** The latter is `resize(nullopt, hist)` and
-  `setCapacity()` is `resize(cap, nullopt)`, so `resize()` is the only place the watermark
-  moves — and a caller may move capacity and history in the same call.
-- **`commit()` is not a flush site at all.** The manager maintains
-  `num_committed_tokens <= history_length <= capacity`, so a committed block is already at
-  or below the watermark and was flushed by the `resize()` that passed it. Where `commit()`
-  advances the watermark it does so by calling `resize()`.
+`_lockHeldBlocks` carries no level hazard. The OOM rollback for `resize` re-locks at the hot
+level, which is where every buffer locks, so a page table's entries and the level its pages
+lock at cannot disagree. No per-target lock level exists: there is no `queryLockLevel`, no
+`BatchedLockTarget::cacheLevel`, no `StaleBackup::cacheLevel` and no `residencyLevel`.
 
-Also: no attention kernel addresses a host page. A sparse layer's kernel reads its units
-from the arena, which is GPU memory bounded by the lease count and the cells a lease holds,
-and a non-sparse layer reads the device pool through its block table as it always has. The
-host pool is reached only by this manager's own copies, which compute their offsets in
-`size_t`.
+No attention kernel addresses a host page. A sparse layer's kernel reads its units from the
+arena, which is GPU memory bounded by the lease count and the cells a lease holds, and a
+non-sparse layer reads the device pool through its block table as it always has. The host
+pool is reached only by this manager's own copies, which compute their offsets in `size_t`.
 
 ## Planned: a selection unit size per layer
 
@@ -1387,22 +1380,22 @@ host-backed pool is most of a group's bytes and none of its quota.
 A level's quota measures one medium, which is why host-backed bytes cannot be drawn from it:
 they consume none of the device bytes it counts, so charging them would cap sparse history at
 a GPU-sized number — the opposite of the point — while leaving those device bytes
-unallocated. Attributing them to a *host tier's* quota instead was considered and rejected:
-`cacheTiers` is a positional list, so "the host tier" may be several or none, and a hot
-pool's size would then change when someone added a cold tier that has nothing to do with it.
+unallocated. No host tier's quota holds them either: `cacheTiers` is a positional list, so
+"the host tier" may be several or none, and a hot pool's size would then change when someone
+added a cold tier that has nothing to do with it.
 
 **Coverage of the data path.** `TestSparseDataPath` asserts the bytes themselves on both
 sides of the copy: a pattern written to a hot page must appear in the cell the fetch names,
 and a pattern written to a cell must appear in its hot page once the watermark passes it.
 
-This was worth building rather than arguing about. Offsetting the page base by one slot and
-re-running showed **57 other sparse tests still passing** -- residency, index shape and
-counts are all insensitive to which allocation the copy reads, which is exactly the mistake
-the move to the hot tier could have introduced.
+It is the only coverage that constrains *which* allocation the copy reads. Offsetting the
+page base by one slot leaves 57 other sparse tests passing, because residency, index shape
+and counts are all insensitive to that address — so nothing else in the suite would catch a
+pool addressed at the wrong base.
 
-**No cell is ever read from, or written to, an encoded page.** Moving sparse pages to the
-hot level made them eligible for demotion for the first time, which raised the question of
-whether a page could be encoded while the cache still held a cell copied from it. It cannot:
+**No cell is ever read from, or written to, an encoded page.** Sparse pages sit at the hot
+level, so they are eligible for demotion, and demotion is what invokes the codec. A page
+cannot be encoded while the cache still holds a cell copied from it:
 
 - An `ACTIVE` request locks the pages it requires (`AGENTS.md`, *Per-request cache*), and
   `LOCKED` forbids eviction outright (*Page status*).
@@ -1428,43 +1421,39 @@ unaffected in either case — the units it crosses lie in `[history, capacity)`,
 watermark `_unlockStaleBlocks` works from, so their pages are locked for as long as the
 request is active.
 
-That is worth stating because it is the *selector*, not this package, that makes it true.
+It is the *selector*, not this package, that makes that true.
 `fetch_sparse_pages` cannot detect an ineligible ordinal — the page table is uniform, so a
 stale ordinal still resolves to a real page of the same request. The combination does not
 arise today in any case: a sliding window already bounds a step's reads to a narrow fixed
 span, which is the span a selection would otherwise have to discover.
 
-## Settled by construction
+## Standing limits and invariants
 
-Recorded because each looks like an open question and is not:
+Properties the rest of the design is entitled to assume.
 
+- **Decode only.** One manager cannot serve prefill and decode together: a sparse kernel
+  indexes its selection per query token, and a multi-token step's selections cannot all be
+  resident in one per-request cache at once. The decode instance of a disaggregated
+  deployment is the supported target — see *Supported scope*.
+- **History never moves backwards.** `resize()` rejects any decrease outright
+  (`kvCache.cpp`: "History length cannot be decreased"), and the only other assignment
+  initialises a fresh request from a prefix match. A flushed block therefore cannot be
+  rewound into, and no further rule is needed to guarantee it.
+- **A selection unit never exceeds `tokens_per_block`.** Sub-page units are supported
+  through `expansion`; a unit spanning several pages is rejected, which is what keeps slot
+  contiguity and k-at-a-time eviction out of the design.
+- **`N` is a uniform upper bound**, not per-request. Ragged device arrays would cost the
+  static shapes graph capture needs.
 - **`num_blocks` lives on the device, in `Batch`.** Deriving it per call from the watermark
   would produce a host value the kernel cannot use, costing an H2D per layer.
 - **Eviction never copies.** An entry is evictable only once flushed, so evicting is a
   free-list push. Flushes are triggered by the watermark alone, never by eviction pressure.
-- **Pinning is not a general scheme.** The pinned set is the in-flight unit, private
-  because unflushed blocks are not in the radix tree, and bounded to one by
-  `max_input_length`. Ordering between the rest still comes from staleness alone.
+- **Pinning covers the in-flight unit only.** That unit is private because unflushed blocks
+  are not in the radix tree, and bounded to one by `max_input_length`. Ordering among the
+  rest comes from staleness alone.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not the sparse granularity lever**, and is rejected on a
   sparse buffer. `sparse_selection_unit_tokens` is — see *Extraction interface*.
-
-## Resolved
-
-- **This *is* decode-only, deliberately.** Sharing one manager between prefill and decode
-  is wrong in kind, not in size: a sparse kernel indexes its selection per query token, and a
-  multi-token step's selections cannot all be made resident in one per-request cache. The
-  decode instance of a disaggregated deployment is the supported target; see *Supported
-  scope*.
-- **A selection unit never exceeds `tokens_per_block`.** Sub-page units are supported
-  through `expansion`; a unit spanning several pages is rejected, which retires the
-  questions of slot contiguity and k-at-a-time eviction.
-- **`N` is a uniform upper bound**, not per-request. Ragged device arrays would cost the
-  static shapes graph capture needs.
-- **History never moves backwards.** `resize()` rejects any decrease outright
-  (`kvCache.cpp`: "History length cannot be decreased"), and the only other assignment
-  initialises a fresh request from a prefix match. A flushed block can therefore never be
-  rewound into, with no rule of our own required.
 
 ## References
 
