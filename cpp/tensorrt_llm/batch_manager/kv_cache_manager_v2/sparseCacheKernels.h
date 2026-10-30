@@ -182,12 +182,6 @@ struct SparseResolveArgs
 [[nodiscard]] size_t sparseResolveSharedBytes(
     int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits);
 
-//! Return the resolve's shared-memory requirement after checking it against the current
-//! device's opt-in limit less the kernel's static shared memory. Used when constructing
-//! a Batch and before launching the kernel; also opts the kernel in to that limit.
-[[nodiscard]] size_t checkedSparseResolveSharedBytes(
-    int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits);
-
 //! Multiprocessors `device` has, which is the one part of the grid sizing below that costs
 //! a driver call and so the one part worth holding on to.
 [[nodiscard]] int32_t sparseCopyMultiprocessors(CUdevice device);
@@ -449,7 +443,8 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream);
 
 //! Launch the resolve. One CTA per row; enqueues and returns.
 //!
-//! Rejects shapes that are inconsistent or need more shared memory than the device allows.
+//! Throws std::invalid_argument when the shape is inconsistent or needs more shared memory
+//! than the device allows.
 void launchSparseResolve(SparseResolveArgs const& args, CUstream stream);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
